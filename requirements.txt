@@ -1,0 +1,5 @@
+requests
+fastparquet
+pandas
+pyarrow
+python-dotenv
