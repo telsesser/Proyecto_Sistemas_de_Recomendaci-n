@@ -8,7 +8,7 @@ import pandas as pd
 import fastparquet
 
 
-START_DATE = "2025-09-01"
+START_DATE = "2025-01-01"
 PARQUET_ENGINE = "fastparquet"
 
 # Configuración de logging
