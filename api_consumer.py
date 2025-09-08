@@ -134,20 +134,11 @@ def github_request(url, params=None, retries=3):
         remaining = resp.headers.get("X-RateLimit-Remaining")
         reset = resp.headers.get("X-RateLimit-Reset")
 
-        if remaining is not None and reset is not None:
-            reset_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(reset)))
-            if int(remaining) < 100:
-                logging.warning(
-                    f"⚠️ Rate limit bajo: {remaining}/{limit} (reset: {reset_time})"
-                )
-
-        if resp.status_code == 403 and resp.headers.get("X-RateLimit-Remaining") == "0":
+        if remaining and int(remaining) <= 0:
             stats["rate_limits"] += 1
-            reset_time = int(resp.headers.get("X-RateLimit-Reset", time.time() + 60))
+            reset_time = int(reset) if reset else time.time() + 60
             sleep_time = max(reset_time - int(time.time()), 60)
-            logging.warning(
-                f"💤 Rate limit alcanzado. Durmiendo {sleep_time} segundos..."
-            )
+            logging.warning(f"💤 Rate limit en generador. Durmiendo {sleep_time}s...")
             update_status()
             time.sleep(sleep_time)
             continue
