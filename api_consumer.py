@@ -22,20 +22,10 @@ MAX_ITEMS_PER_ENDPOINT = 1000  # Límite máximo por endpoint
 BATCH_SIZE = 100  # Procesar en lotes
 FORCE_GC_EVERY = 3  # Forzar garbage collection cada N repos
 
-# Variables globales para estadísticas
-stats = {
-    "start_time": time.time(),
-    "repos_processed": 0,
-    "pages_processed": 0,
-    "api_calls": 0,
-    "last_repo": "",
-    "errors": 0,
-    "rate_limits": 0,
-    "stars_fetched": 0,
-    "contributors_fetched": 0,
-    "forks_fetched": 0,
-    "issues_fetched": 0,
-}
+# NUEVA CONFIGURACIÓN: Tiempo para procesar usuarios (en segundos)
+USER_PROCESSING_INTERVAL = 3600  # 1 hora = 3600 segundos
+MAX_USERS_TO_PROCESS = 1000  # Máximo usuarios a procesar por ciclo
+
 
 # Configuración de logging
 DATA_DIR = "data"
@@ -43,6 +33,37 @@ if not os.path.exists(DATA_DIR):
     os.makedirs(DATA_DIR)
 LOG_PATH = os.path.join(DATA_DIR, "api_consumer.log")
 STATUS_FILE = os.path.join(DATA_DIR, "status.json")
+
+
+# Variables globales para estadísticas
+stats = None
+if os.path.exists(STATUS_FILE):
+    with open(STATUS_FILE, "r") as f:
+        try:
+            stats = json.load(f)
+            stats["start_time"] = time.time()
+        except json.JSONDecodeError:
+            logging.error(
+                "Error al leer el archivo de estado. Se utilizarán valores predeterminados."
+            )
+            stats = None
+
+if not stats:
+    stats = {
+        "start_time": time.time(),
+        "repos_processed": 0,
+        "pages_processed": 0,
+        "api_calls": 0,
+        "last_repo": "",
+        "errors": 0,
+        "rate_limits": 0,
+        "stars_fetched": 0,
+        "contributors_fetched": 0,
+        "forks_fetched": 0,
+        "issues_fetched": 0,
+        "users_processed": 0,
+        "last_user_processing": time.time(),
+    }
 
 logging.basicConfig(
     level=logging.WARNING if not DEBUG else logging.INFO,
@@ -91,6 +112,10 @@ def update_status():
         "contributors_fetched": stats["contributors_fetched"],
         "forks_fetched": stats["forks_fetched"],
         "issues_fetched": stats["issues_fetched"],
+        "users_processed": stats["users_processed"],
+        "last_user_processing": datetime.fromtimestamp(
+            stats["last_user_processing"]
+        ).isoformat(),
     }
 
     with open(STATUS_FILE, "w") as f:
@@ -104,6 +129,7 @@ def log_progress():
         f"📊 PROGRESO: {stats['repos_processed']} repos | "
         f"Página {stats['pages_processed']} | "
         f"API calls: {stats['api_calls']} | "
+        f"Users: {stats['users_processed']} | "
         f"Runtime: {runtime//3600:.0f}h {(runtime%3600)//60:.0f}m | "
         f"Último: {stats['last_repo']}"
     )
@@ -284,6 +310,7 @@ def get_repo_data(owner, repo):
         "created_at": repo_json.get("created_at", ""),
         "updated_at": repo_json.get("updated_at", ""),
         "topics": ",".join(repo_json.get("topics", [])),
+        "processed": True,  # NUEVA COLUMNA: marcar como procesado
     }
 
     # Procesar stargazers en lotes
@@ -420,11 +447,175 @@ def get_repo_data(owner, repo):
     )  # Retornamos listas vacías ya que guardamos directamente
 
 
+def process_users_cycle():
+    """
+    NUEVA FUNCIÓN: Procesa el ciclo de usuarios
+    1. Obtiene usuarios únicos de stars.parquet
+    2. Los mueve a users.parquet
+    3. Para cada usuario, obtiene sus repositorios estrellados
+    4. Agrega nuevos repos a repos.parquet con processed=False
+    """
+    global stats
+
+    logging.info("🔄 Iniciando ciclo de procesamiento de usuarios...")
+
+    stars_path = os.path.join(DATA_DIR, "stars.parquet")
+    users_path = os.path.join(DATA_DIR, "users.parquet")
+    repos_path = os.path.join(DATA_DIR, "repos.parquet")
+
+    # 1. Obtener usuarios únicos de stars.parquet
+    if not os.path.exists(stars_path):
+        logging.info("⚠️ No existe stars.parquet, saltando procesamiento de usuarios")
+        return
+
+    stars_df = pd.read_parquet(stars_path, engine=PARQUET_ENGINE)
+    unique_users = stars_df["user"].unique()
+    logging.info(f"👤 Encontrados {len(unique_users)} usuarios únicos en stars")
+
+    # 2. Crear/actualizar users.parquet
+    existing_users = set()
+    if os.path.exists(users_path):
+        users_df = pd.read_parquet(users_path, engine=PARQUET_ENGINE)
+        existing_users = set(users_df["user"])
+        logging.info(f"👥 Ya existen {len(existing_users)} usuarios procesados")
+    else:
+        users_df = pd.DataFrame(columns=["user", "processed"])
+
+    # Agregar nuevos usuarios
+    new_users = []
+    for user in unique_users:
+        if user not in existing_users:
+            new_users.append({"user": user, "processed": False})
+
+    if new_users:
+        new_users_df = pd.DataFrame(new_users)
+        if len(existing_users) > 0:
+            users_df = pd.concat([users_df, new_users_df], ignore_index=True)
+        else:
+            users_df = new_users_df
+        users_df.to_parquet(users_path, index=False, engine=PARQUET_ENGINE)
+        logging.info(f"➕ Agregados {len(new_users)} usuarios nuevos")
+
+    # 3. Procesar usuarios no procesados (limitado)
+    unprocessed_users = users_df[users_df["processed"] == False]["user"]
+    logging.info(f"🔍 Procesando {len(unprocessed_users)} usuarios...")
+
+    # Cargar repos existentes
+    existing_repos = set()
+    if os.path.exists(repos_path):
+        repos_df = pd.read_parquet(repos_path, engine=PARQUET_ENGINE)
+        existing_repos = set(repos_df["repo"])
+
+    new_repos = []
+    processed_users = []
+
+    for user in unprocessed_users:
+        logging.info(f"👤 Procesando usuario: {user}")
+
+        # 4. Obtener repositorios estrellados por el usuario
+        user_stars_data = github_request(f"{BASE_URL}/users/{user}/starred")
+        if not user_stars_data:
+            processed_users.append(user)
+            stats["users_processed"] += 1
+            continue
+
+        for repo_data in user_stars_data:
+            repo_key = repo_data["full_name"]
+
+            if repo_key not in existing_repos:
+                # Agregar nuevo repositorio con processed=False
+                new_repo_info = {
+                    "repo": repo_key,
+                    "owner": repo_data["owner"]["login"],
+                    "is_fork": repo_data.get("fork", False),
+                    "stars": repo_data.get("stargazers_count", 0),
+                    "forks": repo_data.get("forks_count", 0),
+                    "watchers": repo_data.get("watchers_count", 0),
+                    "open_issues": repo_data.get("open_issues_count", 0),
+                    "has_issues": repo_data.get("has_issues", False),
+                    "has_projects": repo_data.get("has_projects", False),
+                    "has_wiki": repo_data.get("has_wiki", False),
+                    "has_pages": repo_data.get("has_pages", False),
+                    "has_downloads": repo_data.get("has_downloads", False),
+                    "created_at": repo_data.get("created_at", ""),
+                    "updated_at": repo_data.get("updated_at", ""),
+                    "topics": ",".join(repo_data.get("topics", [])),
+                    "processed": False,  # NUEVO REPO, NO PROCESADO
+                }
+                new_repos.append(new_repo_info)
+                existing_repos.add(repo_key)
+
+        processed_users.append(user)
+        stats["users_processed"] += 1
+
+        # Rate limiting protection
+        time.sleep(1)
+
+    # Guardar nuevos repos
+    if new_repos:
+        save_data_batch(new_repos, repos_path)
+        logging.info(f"🆕 Agregados {len(new_repos)} nuevos repositorios para procesar")
+
+    # Marcar usuarios como procesados
+    if processed_users:
+        users_df.loc[users_df["user"].isin(processed_users), "processed"] = True
+        users_df.to_parquet(users_path, index=False, engine=PARQUET_ENGINE)
+        logging.info(f"✅ Marcados {len(processed_users)} usuarios como procesados")
+
+    stats["last_user_processing"] = time.time()
+    logging.info("🔄 Ciclo de procesamiento de usuarios completado")
+
+
+def should_process_users():
+    """
+    Determina si es tiempo de procesar usuarios
+    """
+    return (time.time() - stats["last_user_processing"]) >= USER_PROCESSING_INTERVAL
+
+
+def get_unprocessed_repos():
+    """
+    NUEVA FUNCIÓN: Obtiene repositorios no procesados
+    """
+    repos_path = os.path.join(DATA_DIR, "repos.parquet")
+    if not os.path.exists(repos_path):
+        return []
+
+    repos_df = pd.read_parquet(repos_path, engine=PARQUET_ENGINE)
+
+    # Si no existe la columna processed, agregarla con True para repos existentes
+    if "processed" not in repos_df.columns:
+        repos_df["processed"] = True
+        repos_df.to_parquet(repos_path, index=False, engine=PARQUET_ENGINE)
+        return []
+
+    unprocessed = repos_df[repos_df["processed"] == False]
+    return [
+        (row["owner"], row["repo"].split("/")[-1]) for _, row in unprocessed.iterrows()
+    ]
+
+
+def mark_repo_as_processed(repo_key):
+    """
+    NUEVA FUNCIÓN: Marca un repositorio como procesado
+    """
+    repos_path = os.path.join(DATA_DIR, "repos.parquet")
+    if not os.path.exists(repos_path):
+        return
+
+    repos_df = pd.read_parquet(repos_path, engine=PARQUET_ENGINE)
+    repos_df.loc[repos_df["repo"] == repo_key, "processed"] = True
+    repos_df.to_parquet(repos_path, index=False, engine=PARQUET_ENGINE)
+
+
 if __name__ == "__main__":
-    logging.info("🚀 Iniciando scraper de GitHub...")
+    logging.info("🚀 Iniciando scraper de GitHub con procesamiento de usuarios...")
     logging.info(f"📅 Fecha de inicio: {START_DATE}")
     logging.info(
         f"🔧 Límites: {MAX_ITEMS_PER_ENDPOINT} items/endpoint, lotes de {BATCH_SIZE}"
+    )
+    logging.info(
+        f"👥 Procesamiento de usuarios cada {USER_PROCESSING_INTERVAL/60:.0f} minutos"
     )
 
     if not os.path.exists(DATA_DIR):
@@ -447,6 +638,35 @@ if __name__ == "__main__":
 
     try:
         while True:
+            # NUEVO: Verificar si es tiempo de procesar usuarios
+            if should_process_users():
+                process_users_cycle()
+
+            # NUEVO: Procesar repositorios no procesados primero
+            unprocessed_repos = get_unprocessed_repos()
+            if unprocessed_repos:
+                logging.info(
+                    f"🔄 Procesando {len(unprocessed_repos)} repositorios pendientes..."
+                )
+                for owner, name in unprocessed_repos:
+                    repo_key = f"{owner}/{name}"
+
+                    result = get_repo_data(owner, name)
+                    if result[0] is not None:
+                        repo_info = result[0]
+                        save_data_batch([repo_info], repos_parquet_path)
+                        mark_repo_as_processed(repo_key)
+                        existing_set.add(repo_key)
+
+                    update_status()
+
+                    if time.time() - last_progress_log > 300:
+                        log_progress()
+                        last_progress_log = time.time()
+
+                continue  # Volver al inicio del loop para verificar más repos pendientes
+
+            # Continuar con el flujo normal si no hay repos pendientes
             logging.info(f"📖 Procesando página {page}...")
             repos = get_repos_by_topic("python", per_page=10, page=page)
 
