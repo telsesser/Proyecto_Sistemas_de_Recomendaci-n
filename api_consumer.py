@@ -7,8 +7,11 @@ from dotenv import load_dotenv
 import pandas as pd
 import fastparquet
 
+load_dotenv()
 
-START_DATE = "2025-01-01"
+
+DEBUG = os.getenv("DEBUG", "False").lower() in ("true", "1", "t")
+START_DATE = os.getenv("START_DATE", "2025-01-01")
 PARQUET_ENGINE = "fastparquet"
 
 # Configuración de logging
@@ -18,15 +21,18 @@ if not os.path.exists(DATA_DIR):
 LOG_PATH = os.path.join(DATA_DIR, "api_consumer.log")
 
 logging.basicConfig(
-    level=logging.WARNING,
+    level=logging.WARNING if not DEBUG else logging.DEBUG,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[logging.FileHandler(LOG_PATH, encoding="utf-8"), logging.StreamHandler()],
 )
+if DEBUG:
+    logging.getLogger().setLevel(logging.DEBUG)
+    logging.debug("Modo DEBUG activado")
+    logging.getLogger().addHandler(logging.StreamHandler())
 
 
 # Cargar variables de entorno desde .env
-load_dotenv()
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN2")
 
 if not GITHUB_TOKEN:
@@ -90,9 +96,7 @@ def get_paginated(url, params=None):
             )
             break
         batch = resp.json()
-        logging.debug(
-            f"[get_paginated] Resultados obtenidos en página {page}: {len(batch)}"
-        )
+        logging.debug(f"[{url}] Resultados obtenidos en página {page}: {len(batch)}")
         results.extend(batch)
 
         # link header
@@ -247,6 +251,7 @@ if __name__ == "__main__":
         existing_set = set()
 
     page = 1
+    logging.debug(f"Repositorios ya existentes: {len(existing_set)}")
     while True:
         repos = get_repos_by_topic("python", per_page=10, page=page)
         page += 1
