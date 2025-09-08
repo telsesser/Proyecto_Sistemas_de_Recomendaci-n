@@ -9,12 +9,18 @@ import fastparquet
 from datetime import datetime
 import signal
 import sys
+import gc  # Garbage collector
 
 load_dotenv()
 
 DEBUG = os.getenv("DEBUG", "False").lower() in ("true", "1", "t")
 START_DATE = os.getenv("START_DATE", "2025-08-01")
 PARQUET_ENGINE = "fastparquet"
+
+# Configuración para prevenir memory leaks
+MAX_ITEMS_PER_ENDPOINT = 1000  # Límite máximo por endpoint
+BATCH_SIZE = 100  # Procesar en lotes
+FORCE_GC_EVERY = 3  # Forzar garbage collection cada N repos
 
 # Variables globales para estadísticas
 stats = {
@@ -38,7 +44,6 @@ if not os.path.exists(DATA_DIR):
 LOG_PATH = os.path.join(DATA_DIR, "api_consumer.log")
 STATUS_FILE = os.path.join(DATA_DIR, "status.json")
 
-# Configurar logging con más detalle
 logging.basicConfig(
     level=logging.WARNING if not DEBUG else logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -50,9 +55,7 @@ if DEBUG:
     logging.getLogger().setLevel(logging.INFO)
     logging.info("Modo DEBUG activado")
 
-# Cargar variables de entorno
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN2")
-
 if not GITHUB_TOKEN:
     raise ValueError("❌ No se encontró GITHUB_TOKEN en el .env")
 
@@ -116,7 +119,6 @@ def signal_handler(signum, frame):
     sys.exit(0)
 
 
-# Registrar manejadores de señales
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
@@ -128,14 +130,13 @@ def github_request(url, params=None, retries=3):
     for attempt in range(retries):
         resp = requests.get(url, headers=HEADERS, params=params, allow_redirects=True)
 
-        # Mostrar info de rate limit
         limit = resp.headers.get("X-RateLimit-Limit")
         remaining = resp.headers.get("X-RateLimit-Remaining")
         reset = resp.headers.get("X-RateLimit-Reset")
 
         if remaining is not None and reset is not None:
             reset_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(reset)))
-            if int(remaining) < 100:  # Advertencia cuando quedan pocos requests
+            if int(remaining) < 100:
                 logging.warning(
                     f"⚠️ Rate limit bajo: {remaining}/{limit} (reset: {reset_time})"
                 )
@@ -147,7 +148,7 @@ def github_request(url, params=None, retries=3):
             logging.warning(
                 f"💤 Rate limit alcanzado. Durmiendo {sleep_time} segundos..."
             )
-            update_status()  # Actualizar estado antes de dormir
+            update_status()
             time.sleep(sleep_time)
             continue
 
@@ -163,14 +164,19 @@ def github_request(url, params=None, retries=3):
     return None
 
 
-def get_paginated(url, params=None):
-    results = []
+def get_paginated_generator(url, params=None, max_items=None):
+    """
+    Generador que yield páginas en lugar de acumular todo en memoria
+    """
     page = 1
-    while url:
+    items_fetched = 0
+
+    while url and (max_items is None or items_fetched < max_items):
         if not params:
             params = {}
         params["per_page"] = 100
-        logging.info(f"[get_paginated] Página {page} - URL: {url}")
+
+        logging.info(f"[get_paginated_generator] Página {page} - URL: {url}")
         resp = requests.get(url, headers=HEADERS, params=params)
         stats["api_calls"] += 1
 
@@ -180,7 +186,16 @@ def get_paginated(url, params=None):
             break
 
         batch = resp.json()
-        results.extend(batch)
+
+        # Limitar items si se especifica max_items
+        if max_items and items_fetched + len(batch) > max_items:
+            batch = batch[: max_items - items_fetched]
+
+        items_fetched += len(batch)
+        yield batch
+
+        if not batch or (max_items and items_fetched >= max_items):
+            break
 
         # Link header para siguiente página
         links = resp.headers.get("Link", "")
@@ -191,7 +206,31 @@ def get_paginated(url, params=None):
         url = next_url
         page += 1
 
-    return results
+
+def save_data_batch(data_list, file_path, columns=None):
+    """
+    Guarda datos en lotes para evitar problemas de memoria con append
+    """
+    if not data_list:
+        return
+
+    df = pd.DataFrame(data_list)
+
+    if os.path.exists(file_path):
+        # Leer archivo existente y concatenar
+        existing_df = pd.read_parquet(file_path, engine=PARQUET_ENGINE)
+        combined_df = pd.concat([existing_df, df], ignore_index=True)
+    else:
+        combined_df = df
+
+    # Escribir de vuelta
+    combined_df.to_parquet(file_path, index=False, engine=PARQUET_ENGINE)
+
+    # Limpiar memoria
+    del df, combined_df
+    if "existing_df" in locals():
+        del existing_df
+    gc.collect()
 
 
 def get_repos_by_topic(topic="python", per_page=5, page=1):
@@ -236,115 +275,159 @@ def get_repo_data(owner, repo):
         "topics": ",".join(repo_json.get("topics", [])),
     }
 
-    stars = []
-    contributors = []
-    forks = []
-    issues = []
-
-    # Stars
+    # Procesar stargazers en lotes
     logging.info(f"⭐ Descargando stargazers de {repo_key}...")
-    stargazers = get_paginated(f"{BASE_URL}/repos/{owner}/{repo}/stargazers")
-    logging.info(f"→ {len(stargazers)} stargazers encontrados")
-    for s in stargazers:
-        stars.append(
-            {
-                "repo": repo_key,
-                "user": s["user"]["login"],
-                "timestamp": s["starred_at"],
-            }
-        )
-    stats["stars_fetched"] += len(stars)
-    # Contributors
-    logging.info(f"👥 Descargando contributors de {repo_key}...")
-    contribs = get_paginated(f"{BASE_URL}/repos/{owner}/{repo}/contributors")
-    logging.info(f"→ {len(contribs)} contributors encontrados")
-    for c in contribs:
-        contributors.append(
-            {
-                "repo": repo_key,
-                "user": c["login"],
-                "commits": c["contributions"],
-            }
-        )
-    stats["contributors_fetched"] += len(contributors)
-    # Forks
-    logging.info(f"🍴 Descargando forks de {repo_key}...")
-    repo_forks = get_paginated(f"{BASE_URL}/repos/{owner}/{repo}/forks")
-    logging.info(f"→ {len(repo_forks)} forks encontrados")
-    for f in repo_forks:
-        forks.append(
-            {
-                "repo": repo_key,
-                "user": f["owner"]["login"],
-                "timestamp": f["created_at"],
-                "name": f["full_name"],
-                "url": f["html_url"],
-            }
-        )
-    stats["forks_fetched"] += len(forks)
-    # Issues
-    logging.info(f"🐞 Descargando issues de {repo_key}...")
-    repo_issues = get_paginated(
-        f"{BASE_URL}/repos/{owner}/{repo}/issues", params={"state": "all"}
-    )
-    issues_count = 0
-    for i in repo_issues:
-        if "pull_request" not in i:
-            issues.append(
+    stars = []
+    for batch in get_paginated_generator(
+        f"{BASE_URL}/repos/{owner}/{repo}/stargazers", max_items=MAX_ITEMS_PER_ENDPOINT
+    ):
+        for s in batch:
+            stars.append(
                 {
                     "repo": repo_key,
-                    "user": i["user"]["login"],
-                    "timestamp": i["created_at"],
-                    "url": i["html_url"],
+                    "user": s["user"]["login"],
+                    "timestamp": s["starred_at"],
                 }
             )
-            issues_count += 1
-    logging.info(f"→ {issues_count} issues encontrados (sin PRs)")
-    stats["issues_fetched"] += len(issues)
+
+        # Procesar lotes para evitar acumulación en memoria
+        if len(stars) >= BATCH_SIZE:
+            save_data_batch(stars, os.path.join(DATA_DIR, "stars.parquet"))
+            stats["stars_fetched"] += len(stars)
+            stars = []  # Limpiar lista
+
+    # Guardar resto si queda algo
+    if stars:
+        save_data_batch(stars, os.path.join(DATA_DIR, "stars.parquet"))
+        stats["stars_fetched"] += len(stars)
+
+    logging.info(f"→ {stats['stars_fetched']} stargazers procesados")
+
+    # Procesar contributors en lotes
+    logging.info(f"👥 Descargando contributors de {repo_key}...")
+    contributors = []
+    for batch in get_paginated_generator(
+        f"{BASE_URL}/repos/{owner}/{repo}/contributors",
+        max_items=MAX_ITEMS_PER_ENDPOINT,
+    ):
+        for c in batch:
+            contributors.append(
+                {
+                    "repo": repo_key,
+                    "user": c["login"],
+                    "commits": c["contributions"],
+                }
+            )
+
+        if len(contributors) >= BATCH_SIZE:
+            save_data_batch(
+                contributors, os.path.join(DATA_DIR, "contributors.parquet")
+            )
+            stats["contributors_fetched"] += len(contributors)
+            contributors = []
+
+    if contributors:
+        save_data_batch(contributors, os.path.join(DATA_DIR, "contributors.parquet"))
+        stats["contributors_fetched"] += len(contributors)
+
+    logging.info(f"→ {stats['contributors_fetched']} contributors procesados")
+
+    # Procesar forks en lotes
+    logging.info(f"🍴 Descargando forks de {repo_key}...")
+    forks = []
+    for batch in get_paginated_generator(
+        f"{BASE_URL}/repos/{owner}/{repo}/forks", max_items=MAX_ITEMS_PER_ENDPOINT
+    ):
+        for f in batch:
+            forks.append(
+                {
+                    "repo": repo_key,
+                    "user": f["owner"]["login"],
+                    "timestamp": f["created_at"],
+                    "name": f["full_name"],
+                    "url": f["html_url"],
+                }
+            )
+
+        if len(forks) >= BATCH_SIZE:
+            save_data_batch(forks, os.path.join(DATA_DIR, "forks.parquet"))
+            stats["forks_fetched"] += len(forks)
+            forks = []
+
+    if forks:
+        save_data_batch(forks, os.path.join(DATA_DIR, "forks.parquet"))
+        stats["forks_fetched"] += len(forks)
+
+    logging.info(f"→ {stats['forks_fetched']} forks procesados")
+
+    # Procesar issues en lotes
+    logging.info(f"🐞 Descargando issues de {repo_key}...")
+    issues = []
+    for batch in get_paginated_generator(
+        f"{BASE_URL}/repos/{owner}/{repo}/issues",
+        params={"state": "all"},
+        max_items=MAX_ITEMS_PER_ENDPOINT,
+    ):
+        for i in batch:
+            if "pull_request" not in i:  # Filtrar PRs
+                issues.append(
+                    {
+                        "repo": repo_key,
+                        "user": i["user"]["login"],
+                        "timestamp": i["created_at"],
+                        "url": i["html_url"],
+                    }
+                )
+
+        if len(issues) >= BATCH_SIZE:
+            save_data_batch(issues, os.path.join(DATA_DIR, "issues.parquet"))
+            stats["issues_fetched"] += len(issues)
+            issues = []
+
+    if issues:
+        save_data_batch(issues, os.path.join(DATA_DIR, "issues.parquet"))
+        stats["issues_fetched"] += len(issues)
+
+    logging.info(f"→ {stats['issues_fetched']} issues procesados")
+
     stats["repos_processed"] += 1
     logging.info(f"✅ {repo_key} completado ({stats['repos_processed']} repos totales)")
-    return repo_info, stars, contributors, forks, issues
+
+    # Forzar garbage collection periódicamente
+    if stats["repos_processed"] % FORCE_GC_EVERY == 0:
+        gc.collect()
+        logging.info(
+            f"🧹 Garbage collection ejecutado (repo #{stats['repos_processed']})"
+        )
+
+    return (
+        repo_info,
+        [],
+        [],
+        [],
+        [],
+    )  # Retornamos listas vacías ya que guardamos directamente
 
 
 if __name__ == "__main__":
     logging.info("🚀 Iniciando scraper de GitHub...")
     logging.info(f"📅 Fecha de inicio: {START_DATE}")
+    logging.info(
+        f"🔧 Límites: {MAX_ITEMS_PER_ENDPOINT} items/endpoint, lotes de {BATCH_SIZE}"
+    )
 
-    # Crear carpeta /data si no existe
     if not os.path.exists(DATA_DIR):
         os.makedirs(DATA_DIR)
 
-    # Cargar repos ya existentes
     repos_parquet_path = os.path.join(DATA_DIR, "repos.parquet")
-    stars_parquet_path = os.path.join(DATA_DIR, "stars.parquet")
-    contribs_parquet_path = os.path.join(DATA_DIR, "contributors.parquet")
-    forks_parquet_path = os.path.join(DATA_DIR, "forks.parquet")
-    issues_parquet_path = os.path.join(DATA_DIR, "issues.parquet")
 
     if os.path.exists(repos_parquet_path):
         existing_repos = pd.read_parquet(repos_parquet_path)
         existing_set = set(existing_repos["repo"])
         logging.info(f"📚 Cargados {len(existing_set)} repos existentes")
+        del existing_repos  # Liberar memoria
+        gc.collect()
     else:
-        existing_repos = pd.DataFrame(
-            columns=[
-                "repo",
-                "owner",
-                "is_fork",
-                "stars",
-                "forks",
-                "watchers",
-                "open_issues",
-                "has_issues",
-                "has_projects",
-                "has_wiki",
-                "has_pages",
-                "has_downloads",
-                "created_at",
-                "updated_at",
-                "topics",
-            ]
-        )
         existing_set = set()
         logging.info("📝 Iniciando desde cero")
 
@@ -371,60 +454,22 @@ if __name__ == "__main__":
                     continue
 
                 result = get_repo_data(owner, name)
-                if result[0] is None:  # Error en el repo
+                if result[0] is None:
                     continue
 
-                repo_info, stars, contribs, forks, issues = result
+                repo_info = result[0]
 
-                # Guardar datos
-                pd.DataFrame([repo_info]).to_parquet(
-                    repos_parquet_path,
-                    index=False,
-                    engine=PARQUET_ENGINE,
-                    append=True if os.path.exists(repos_parquet_path) else False,
-                )
+                # Guardar repo info
+                save_data_batch([repo_info], repos_parquet_path)
                 existing_set.add(repo_key)
 
-                if stars:
-                    pd.DataFrame(stars).to_parquet(
-                        stars_parquet_path,
-                        index=False,
-                        engine=PARQUET_ENGINE,
-                        append=True if os.path.exists(stars_parquet_path) else False,
-                    )
-                if contribs:
-                    pd.DataFrame(contribs).to_parquet(
-                        contribs_parquet_path,
-                        index=False,
-                        engine=PARQUET_ENGINE,
-                        append=True if os.path.exists(contribs_parquet_path) else False,
-                    )
-                if forks:
-                    pd.DataFrame(forks).to_parquet(
-                        forks_parquet_path,
-                        index=False,
-                        engine=PARQUET_ENGINE,
-                        append=True if os.path.exists(forks_parquet_path) else False,
-                    )
-                if issues:
-                    pd.DataFrame(issues).to_parquet(
-                        issues_parquet_path,
-                        index=False,
-                        engine=PARQUET_ENGINE,
-                        append=True if os.path.exists(issues_parquet_path) else False,
-                    )
-
-                # Actualizar estado cada repo
                 update_status()
 
-                # Log de progreso cada 5 minutos
-                if time.time() - last_progress_log > 300:  # 5 minutos
+                if time.time() - last_progress_log > 300:
                     log_progress()
                     last_progress_log = time.time()
 
             page += 1
-
-            # Pequeña pausa entre páginas
             time.sleep(2)
 
     except KeyboardInterrupt:
