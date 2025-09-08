@@ -490,8 +490,6 @@ def process_users_cycle():
     stars_df = pd.read_parquet(stars_path, engine=PARQUET_ENGINE)
     unique_users = stars_df["user"].unique()
     logging.info(f"👤 Encontrados {len(unique_users)} usuarios únicos en stars")
-    del stars_df  # Liberar memoria
-    gc.collect()
 
     # 2. Crear/actualizar users.parquet
     existing_users = set()
@@ -649,6 +647,14 @@ if __name__ == "__main__":
 
     if os.path.exists(repos_parquet_path):
         existing_repos = pd.read_parquet(repos_parquet_path)
+        if "processed" not in existing_repos.columns:
+            existing_repos["processed"] = True
+
+        elif existing_repos["processed"].isnull().any():
+            existing_repos["processed"] = existing_repos["processed"].fillna(True)
+            existing_repos.to_parquet(
+                repos_parquet_path, index=False, engine=PARQUET_ENGINE
+            )
         existing_set = set(existing_repos["repo"])
         logging.info(f"📚 Cargados {len(existing_set)} repos existentes")
         del existing_repos  # Liberar memoria
