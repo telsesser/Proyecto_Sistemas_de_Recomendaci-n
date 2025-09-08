@@ -62,10 +62,11 @@ def show_status():
     # Info de archivos
     files = {
         "repos": get_file_info(os.path.join(data_dir, "repos.parquet")),
-        "stars": get_file_info(os.path.join(data_dir, "stars.parquet")),
+        "stars": get_file_info(os.path.join(data_dir, "stargazers.parquet")),
         "contributors": get_file_info(os.path.join(data_dir, "contributors.parquet")),
         "forks": get_file_info(os.path.join(data_dir, "forks.parquet")),
         "issues": get_file_info(os.path.join(data_dir, "issues.parquet")),
+        "users": get_file_info(os.path.join(data_dir, "users.parquet")),
     }
 
     # Últimas líneas del log
