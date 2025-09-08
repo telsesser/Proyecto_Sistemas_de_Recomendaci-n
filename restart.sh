@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Configuración
-SCRIPT_NAME="tu_script.py"  # Cambia por el nombre de tu script
+SCRIPT_NAME="api_consumer.py"  # Cambia por el nombre de tu script
 LOG_FILE="output.log"
 
 echo "🔄 Reiniciando $SCRIPT_NAME..."
