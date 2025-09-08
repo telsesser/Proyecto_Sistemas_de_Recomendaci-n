@@ -23,8 +23,8 @@ BATCH_SIZE = 100  # Procesar en lotes
 FORCE_GC_EVERY = 3  # Forzar garbage collection cada N repos
 
 # NUEVA CONFIGURACIÓN: Tiempo para procesar usuarios (en segundos)
-USER_PROCESSING_INTERVAL = 3600  # 1 hora = 3600 segundos
-MAX_USERS_TO_PROCESS = 1000  # Máximo usuarios a procesar por ciclo
+USER_PROCESSING_INTERVAL = 360
+MAX_USERS_TO_PROCESS = 10  # Máximo usuarios a procesar por ciclo
 
 
 # Configuración de logging
@@ -42,6 +42,9 @@ if os.path.exists(STATUS_FILE):
         try:
             stats = json.load(f)
             stats["start_time"] = time.time()
+            if stats.get("users_processed") is None:
+                stats["users_processed"] = 0
+                stats["last_user_processing"] = 0
         except json.JSONDecodeError:
             logging.error(
                 "Error al leer el archivo de estado. Se utilizarán valores predeterminados."
@@ -62,7 +65,7 @@ if not stats:
         "forks_fetched": 0,
         "issues_fetched": 0,
         "users_processed": 0,
-        "last_user_processing": time.time(),
+        "last_user_processing": 0,
     }
 
 logging.basicConfig(
@@ -113,9 +116,7 @@ def update_status():
         "forks_fetched": stats["forks_fetched"],
         "issues_fetched": stats["issues_fetched"],
         "users_processed": stats["users_processed"],
-        "last_user_processing": datetime.fromtimestamp(
-            stats["last_user_processing"]
-        ).isoformat(),
+        "last_user_processing": stats["last_user_processing"],
     }
 
     with open(STATUS_FILE, "w") as f:
@@ -467,10 +468,11 @@ def process_users_cycle():
     if not os.path.exists(stars_path):
         logging.info("⚠️ No existe stars.parquet, saltando procesamiento de usuarios")
         return
-
     stars_df = pd.read_parquet(stars_path, engine=PARQUET_ENGINE)
     unique_users = stars_df["user"].unique()
     logging.info(f"👤 Encontrados {len(unique_users)} usuarios únicos en stars")
+    del stars_df  # Liberar memoria
+    gc.collect()
 
     # 2. Crear/actualizar users.parquet
     existing_users = set()
@@ -479,13 +481,13 @@ def process_users_cycle():
         existing_users = set(users_df["user"])
         logging.info(f"👥 Ya existen {len(existing_users)} usuarios procesados")
     else:
-        users_df = pd.DataFrame(columns=["user", "processed"])
+        users_df = pd.DataFrame(columns=["user", "processed", "stars_count"])
 
     # Agregar nuevos usuarios
     new_users = []
     for user in unique_users:
         if user not in existing_users:
-            new_users.append({"user": user, "processed": False})
+            new_users.append({"user": user, "processed": False, "stars_count": 0})
 
     if new_users:
         new_users_df = pd.DataFrame(new_users)
@@ -514,42 +516,42 @@ def process_users_cycle():
     for user in unprocessed_users:
         logging.info(f"👤 Procesando usuario: {user}")
 
-        # 4. Obtener repositorios estrellados por el usuario
-        user_stars_data = github_request(f"{BASE_URL}/users/{user}/starred")
-        if not user_stars_data:
-            processed_users.append(user)
-            stats["users_processed"] += 1
-            continue
-
-        for repo_data in user_stars_data:
-            repo_key = repo_data["full_name"]
-
-            if repo_key not in existing_repos:
-                # Agregar nuevo repositorio con processed=False
-                new_repo_info = {
-                    "repo": repo_key,
-                    "owner": repo_data["owner"]["login"],
-                    "is_fork": repo_data.get("fork", False),
-                    "stars": repo_data.get("stargazers_count", 0),
-                    "forks": repo_data.get("forks_count", 0),
-                    "watchers": repo_data.get("watchers_count", 0),
-                    "open_issues": repo_data.get("open_issues_count", 0),
-                    "has_issues": repo_data.get("has_issues", False),
-                    "has_projects": repo_data.get("has_projects", False),
-                    "has_wiki": repo_data.get("has_wiki", False),
-                    "has_pages": repo_data.get("has_pages", False),
-                    "has_downloads": repo_data.get("has_downloads", False),
-                    "created_at": repo_data.get("created_at", ""),
-                    "updated_at": repo_data.get("updated_at", ""),
-                    "topics": ",".join(repo_data.get("topics", [])),
-                    "processed": False,  # NUEVO REPO, NO PROCESADO
-                }
-                new_repos.append(new_repo_info)
-                existing_repos.add(repo_key)
-
+        # 4. Obtener repositorios estrellados por el usuario usando paginación
+        starred_batches = get_paginated_generator(f"{BASE_URL}/users/{user}/starred")
+        user_starred_count = 0
+        for batch in starred_batches:
+            if not batch:
+                continue
+            for starred_data in batch:
+                repo_data = starred_data["repo"]
+                repo_key = repo_data["full_name"]
+                user_starred_count += 1
+                if repo_key not in existing_repos:
+                    # Agregar nuevo repositorio con processed=False
+                    new_repo_info = {
+                        "repo": repo_key,
+                        "owner": repo_data["owner"]["login"],
+                        "is_fork": repo_data.get("fork", False),
+                        "stars": repo_data.get("stargazers_count", 0),
+                        "forks": repo_data.get("forks_count", 0),
+                        "watchers": repo_data.get("watchers_count", 0),
+                        "open_issues": repo_data.get("open_issues_count", 0),
+                        "has_issues": repo_data.get("has_issues", False),
+                        "has_projects": repo_data.get("has_projects", False),
+                        "has_wiki": repo_data.get("has_wiki", False),
+                        "has_pages": repo_data.get("has_pages", False),
+                        "has_downloads": repo_data.get("has_downloads", False),
+                        "created_at": repo_data.get("created_at", ""),
+                        "updated_at": repo_data.get("updated_at", ""),
+                        "topics": ",".join(repo_data.get("topics", [])),
+                        "processed": False,  # NUEVO REPO, NO PROCESADO
+                    }
+                    new_repos.append(new_repo_info)
+                    existing_repos.add(repo_key)
+        # Actualizar stars_count para el usuario
+        users_df.loc[users_df["user"] == user, "stars_count"] = user_starred_count
         processed_users.append(user)
         stats["users_processed"] += 1
-
         # Rate limiting protection
         time.sleep(1)
 
@@ -635,7 +637,6 @@ if __name__ == "__main__":
         existing_set = set()
         logging.info("📝 Iniciando desde cero")
 
-    page = 1
     last_progress_log = time.time()
 
     try:
@@ -669,14 +670,14 @@ if __name__ == "__main__":
                 continue  # Volver al inicio del loop para verificar más repos pendientes
 
             # Continuar con el flujo normal si no hay repos pendientes
-            logging.info(f"📖 Procesando página {page}...")
-            repos = get_repos_by_topic("python", per_page=10, page=page)
+            logging.info(f"📖 Procesando página {stats['pages_processed']}...")
+            repos = get_repos_by_topic(
+                "python", per_page=10, page=stats["pages_processed"]
+            )
 
             if not repos:
                 logging.info("🏁 No hay más repositorios para procesar")
                 break
-
-            stats["pages_processed"] = page
 
             for r in repos:
                 owner, name = r["owner"]["login"], r["name"]
@@ -702,7 +703,8 @@ if __name__ == "__main__":
                     log_progress()
                     last_progress_log = time.time()
 
-            page += 1
+            stats["pages_processed"] += 1
+
             time.sleep(2)
 
     except KeyboardInterrupt:
@@ -710,6 +712,7 @@ if __name__ == "__main__":
     except Exception as e:
         logging.error(f"💥 Error inesperado: {e}")
         stats["errors"] += 1
+        raise
     finally:
         update_status()
         log_progress()
