@@ -12,7 +12,6 @@ import signal
 import sys
 import gc  # Garbage collector
 import shutil
-import duckdb
 from typing import List, Dict, Optional, Tuple, AsyncGenerator
 
 load_dotenv()
@@ -511,10 +510,10 @@ async def process_users_cycle_async(session: aiohttp.ClientSession):
         return
 
     # Usar duckdb para obtener usuarios únicos sin cargar todo el parquet en memoria
-    con = duckdb.connect()
-    query = f"SELECT DISTINCT user FROM '{stars_path}'"
-    unique_users = con.execute(query).fetchdf()["user"].tolist()
-    con.close()
+    stars_df = pd.read_parquet(stars_path, engine=PARQUET_ENGINE)
+    unique_users = set(stars_df["user"].unique())
+    del stars_df
+    gc.collect()
     logging.info(f"👤 Encontrados {len(unique_users)} usuarios únicos en stars")
 
     # 2. Crear/actualizar users.parquet
