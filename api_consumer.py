@@ -11,6 +11,7 @@ import signal
 import sys
 import gc  # Garbage collector
 import shutil
+import duckdb
 
 load_dotenv()
 
@@ -487,8 +488,12 @@ def process_users_cycle():
     if not os.path.exists(stars_path):
         logging.info("⚠️ No existe stars.parquet, saltando procesamiento de usuarios")
         return
-    stars_df = pd.read_parquet(stars_path, engine=PARQUET_ENGINE)
-    unique_users = stars_df["user"].unique()
+
+    # Usar duckdb para obtener usuarios únicos sin cargar todo el parquet en memoria
+    con = duckdb.connect()
+    query = f"SELECT DISTINCT user FROM '{stars_path}'"
+    unique_users = con.execute(query).fetchdf()["user"].tolist()
+    con.close()
     logging.info(f"👤 Encontrados {len(unique_users)} usuarios únicos en stars")
 
     # 2. Crear/actualizar users.parquet
@@ -628,6 +633,8 @@ def mark_repo_as_processed(repo_key):
     repos_df = pd.read_parquet(repos_path, engine=PARQUET_ENGINE)
     repos_df.loc[repos_df["repo"] == repo_key, "processed"] = True
     repos_df.to_parquet(repos_path, index=False, engine=PARQUET_ENGINE)
+    del repos_df
+    gc.collect()
 
 
 if __name__ == "__main__":
