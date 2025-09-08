@@ -212,7 +212,7 @@ def get_paginated_generator(url, params=None, max_items=None):
         page += 1
 
         # Seguridad: evitar bucles infinitos
-        if page > 1000:
+        if page > 5000:
             logging.warning(
                 f"⚠️ Alcanzado límite de seguridad de páginas, deteniendo..."
             )
