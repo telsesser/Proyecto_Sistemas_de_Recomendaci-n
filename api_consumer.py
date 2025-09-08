@@ -1,4 +1,5 @@
-import requests
+import aiohttp
+import asyncio
 import time
 import os
 import json
@@ -12,15 +13,16 @@ import sys
 import gc  # Garbage collector
 import shutil
 import duckdb
+from typing import List, Dict, Optional, Tuple, AsyncGenerator
 
 load_dotenv()
 
 DEBUG = os.getenv("DEBUG", "False").lower() in ("true", "1", "t")
-START_DATE = os.getenv("START_DATE", "2025-08-01")
+START_DATE = os.getenv("START_DATE", "2025-01-01")
 PARQUET_ENGINE = "fastparquet"
 
 # Configuración para prevenir memory leaks
-MAX_ITEMS_PER_ENDPOINT = 1000  # Límite máximo por endpoint
+MAX_ITEMS_PER_ENDPOINT = 3000  # Límite máximo por endpoint
 BATCH_SIZE = 100  # Procesar en lotes
 FORCE_GC_EVERY = 3  # Forzar garbage collection cada N repos
 
@@ -31,6 +33,10 @@ MAX_USERS_TO_PROCESS = 10  # Máximo usuarios a procesar por ciclo
 # NUEVA CONFIGURACIÓN: Tiempo de espera para copias de seguridad (en segundos)
 BACKUP_TIMEOUT = 3600  # 1 hora
 
+# CONFIGURACIÓN ASÍNCRONA
+MAX_CONCURRENT_REQUESTS = 10  # Máximo requests concurrentes
+SEMAPHORE_LIMIT = 5  # Límite del semáforo para controlar concurrencia
+REQUEST_DELAY = 0.1  # Delay entre requests para evitar rate limiting
 
 # Configuración de logging
 DATA_DIR = "data"
@@ -38,7 +44,6 @@ if not os.path.exists(DATA_DIR):
     os.makedirs(DATA_DIR)
 LOG_PATH = os.path.join(DATA_DIR, "api_consumer.log")
 STATUS_FILE = os.path.join(DATA_DIR, "status.json")
-
 
 # Variables globales para estadísticas
 stats = None
@@ -94,8 +99,12 @@ if not GITHUB_TOKEN:
 HEADERS = {
     "Authorization": f"Bearer {GITHUB_TOKEN}",
     "Accept": "application/vnd.github.v3.star+json",
+    "User-Agent": "GitHub-Scraper-AsyncIO/1.0",
 }
 BASE_URL = "https://api.github.com"
+
+# Semáforo global para controlar concurrencia
+request_semaphore = asyncio.Semaphore(SEMAPHORE_LIMIT)
 
 
 def update_status():
@@ -170,39 +179,78 @@ def backup_data_folder():
         logging.error(f"❌ Error al crear copia de seguridad: {e}")
 
 
-def github_request(url, params=None, retries=3):
+async def github_request_async(
+    session: aiohttp.ClientSession,
+    url: str,
+    params: Optional[Dict] = None,
+    retries: int = 3,
+) -> Optional[Dict]:
+    """Versión asíncrona de github_request con manejo de rate limiting"""
     global stats
-    stats["api_calls"] += 1
 
-    for attempt in range(retries):
-        resp = requests.get(url, headers=HEADERS, params=params, allow_redirects=True)
+    async with request_semaphore:
+        stats["api_calls"] += 1
 
-        limit = resp.headers.get("X-RateLimit-Limit")
-        remaining = resp.headers.get("X-RateLimit-Remaining")
-        reset = resp.headers.get("X-RateLimit-Reset")
-        stats["rate_limits"] = remaining
-        if remaining and int(remaining) <= 0:
-            reset_time = int(reset) if reset else time.time() + 60
-            sleep_time = max(reset_time - int(time.time()), 60)
-            logging.warning(f"💤 Rate limit en generador. Durmiendo {sleep_time}s...")
-            update_status()
-            time.sleep(sleep_time)
-            continue
+        for attempt in range(retries):
+            try:
+                await asyncio.sleep(
+                    REQUEST_DELAY
+                )  # Pequeño delay para evitar rate limiting
 
-        if resp.ok:
-            return resp.json()
-        else:
-            stats["errors"] += 1
-            logging.error(f"❌ Error en API: {resp.status_code} - {url}")
+                async with session.get(url, params=params) as resp:
+                    # Obtener headers de rate limiting
+                    remaining = resp.headers.get("X-RateLimit-Remaining")
+                    reset = resp.headers.get("X-RateLimit-Reset")
 
-        time.sleep(2**attempt)
+                    if remaining:
+                        stats["rate_limits"] = int(remaining)
 
-    stats["errors"] += 1
-    return None
+                        # Si quedan pocos requests, esperar
+                        if int(remaining) <= 10:
+                            reset_time = int(reset) if reset else time.time() + 60
+                            sleep_time = max(reset_time - int(time.time()), 60)
+                            logging.warning(
+                                f"💤 Rate limit bajo ({remaining}). Durmiendo {sleep_time}s..."
+                            )
+                            update_status()
+                            await asyncio.sleep(sleep_time)
+                            continue
+
+                    if resp.status == 200:
+                        return await resp.json()
+                    elif (
+                        resp.status == 403
+                        and "rate limit" in (await resp.text()).lower()
+                    ):
+                        # Rate limit específico
+                        reset_time = int(reset) if reset else time.time() + 60
+                        sleep_time = max(reset_time - int(time.time()), 60)
+                        logging.warning(
+                            f"💤 Rate limit alcanzado. Durmiendo {sleep_time}s..."
+                        )
+                        await asyncio.sleep(sleep_time)
+                        continue
+                    else:
+                        stats["errors"] += 1
+                        logging.error(f"❌ Error en API: {resp.status} - {url}")
+
+            except Exception as e:
+                logging.error(f"❌ Error en request: {e}")
+                stats["errors"] += 1
+
+            # Esperar antes del siguiente intento
+            await asyncio.sleep(2**attempt)
+
+        return None
 
 
-def get_paginated_generator(url, params=None, max_items=None):
-    global stats
+async def get_paginated_async(
+    session: aiohttp.ClientSession,
+    url: str,
+    params: Optional[Dict] = None,
+    max_items: Optional[int] = None,
+) -> AsyncGenerator[List[Dict], None]:
+    """Generador asíncrono para paginación"""
     page = 1
     items_fetched = 0
 
@@ -211,58 +259,62 @@ def get_paginated_generator(url, params=None, max_items=None):
             params = {}
         params["per_page"] = 100
 
-        logging.info(f"[get_paginated_generator] Página {page} - URL: {url}")
+        logging.info(f"[get_paginated_async] Página {page} - URL: {url}")
 
-        # Hacer la llamada directamente para obtener headers
-        resp = requests.get(url, headers=HEADERS, params=params)
-        stats["api_calls"] += 1
+        # Hacer request asíncrono
+        async with session.get(url, params=params) as resp:
+            stats["api_calls"] += 1
 
-        # Control de rate limiting manual
-        remaining = resp.headers.get("X-RateLimit-Remaining")
-        reset = resp.headers.get("X-RateLimit-Reset")
-        stats["rate_limits"] = remaining
+            # Control de rate limiting
+            remaining = resp.headers.get("X-RateLimit-Remaining")
+            reset = resp.headers.get("X-RateLimit-Reset")
 
-        if remaining and int(remaining) <= 0:
-            reset_time = int(reset) if reset else time.time() + 60
-            sleep_time = max(reset_time - int(time.time()), 60)
-            logging.warning(f"💤 Rate limit en generador. Durmiendo {sleep_time}s...")
-            update_status()
-            time.sleep(sleep_time)
-            continue
+            if remaining:
+                stats["rate_limits"] = int(remaining)
 
-        if not resp.ok:
-            logging.error(f"❌ Error en paginación: status {resp.status_code}")
-            stats["errors"] += 1
-            break
+                if int(remaining) <= 10:
+                    reset_time = int(reset) if reset else time.time() + 60
+                    sleep_time = max(reset_time - int(time.time()), 60)
+                    logging.warning(
+                        f"💤 Rate limit en paginación. Durmiendo {sleep_time}s..."
+                    )
+                    update_status()
+                    await asyncio.sleep(sleep_time)
+                    continue
 
-        batch = resp.json()
+            if resp.status != 200:
+                logging.error(f"❌ Error en paginación: status {resp.status}")
+                stats["errors"] += 1
+                break
 
-        # Limitar items si se especifica max_items
-        if max_items and items_fetched + len(batch) > max_items:
-            batch = batch[: max_items - items_fetched]
+            batch = await resp.json()
 
-        items_fetched += len(batch)
-        yield batch
+            # Limitar items si se especifica max_items
+            if max_items and items_fetched + len(batch) > max_items:
+                batch = batch[: max_items - items_fetched]
 
-        if not batch or (max_items and items_fetched >= max_items):
-            break
+            items_fetched += len(batch)
+            yield batch
 
-        # Usar Link header para siguiente página
-        links = resp.headers.get("Link", "")
-        next_url = None
-        for part in links.split(","):
-            if 'rel="next"' in part:
-                next_url = part[part.find("<") + 1 : part.find(">")]
+            if not batch or (max_items and items_fetched >= max_items):
+                break
 
-        url = next_url
-        page += 1
+            # Usar Link header para siguiente página
+            links = resp.headers.get("Link", "")
+            next_url = None
+            for part in links.split(","):
+                if 'rel="next"' in part:
+                    next_url = part[part.find("<") + 1 : part.find(">")]
 
-        # Seguridad: evitar bucles infinitos
-        if page > 5000:
-            logging.warning(
-                f"⚠️ Alcanzado límite de seguridad de páginas, deteniendo..."
-            )
-            break
+            url = next_url
+            page += 1
+
+            # Seguridad: evitar bucles infinitos
+            if page > 5000:
+                logging.warning(
+                    f"⚠️ Alcanzado límite de seguridad de páginas, deteniendo..."
+                )
+                break
 
 
 def save_data_batch(data_list, file_path, columns=None):
@@ -291,27 +343,100 @@ def save_data_batch(data_list, file_path, columns=None):
     gc.collect()
 
 
-def get_repos_by_topic(topic="python", per_page=5, page=1):
+async def get_repos_by_topic_async(
+    session: aiohttp.ClientSession,
+    topic: str = "python",
+    per_page: int = 5,
+    page: int = 1,
+) -> List[Dict]:
+    """Versión asíncrona de get_repos_by_topic"""
     url = f"{BASE_URL}/search/repositories"
     params = {
         "q": f"topic:{topic} created:>{START_DATE}",
         "per_page": per_page,
         "page": page,
     }
-    data = github_request(url, params)
+    data = await github_request_async(session, url, params)
     if not data:
         return []
     return data["items"]
 
 
-def get_repo_data(owner, repo):
+async def fetch_repo_endpoint(
+    session: aiohttp.ClientSession,
+    endpoint_url: str,
+    repo_key: str,
+    endpoint_name: str,
+    max_items: int = MAX_ITEMS_PER_ENDPOINT,
+) -> List[Dict]:
+    """Función auxiliar para obtener datos de un endpoint específico de forma asíncrona"""
+    data = []
+
+    async for batch in get_paginated_async(session, endpoint_url, max_items=max_items):
+        for item in batch:
+            if endpoint_name == "stargazers":
+                data.append(
+                    {
+                        "repo": repo_key,
+                        "user": item["user"]["login"],
+                        "timestamp": item["starred_at"],
+                    }
+                )
+            elif endpoint_name == "contributors":
+                data.append(
+                    {
+                        "repo": repo_key,
+                        "user": item["login"],
+                        "commits": item["contributions"],
+                    }
+                )
+            elif endpoint_name == "forks":
+                data.append(
+                    {
+                        "repo": repo_key,
+                        "user": item["owner"]["login"],
+                        "timestamp": item["created_at"],
+                        "name": item["full_name"],
+                        "url": item["html_url"],
+                    }
+                )
+            elif endpoint_name == "issues":
+                if "pull_request" not in item:  # Filtrar PRs
+                    data.append(
+                        {
+                            "repo": repo_key,
+                            "user": item["user"]["login"],
+                            "timestamp": item["created_at"],
+                            "url": item["html_url"],
+                        }
+                    )
+
+        # Procesar en lotes para evitar acumulación en memoria
+        if len(data) >= BATCH_SIZE:
+            save_data_batch(data, os.path.join(DATA_DIR, f"{endpoint_name}.parquet"))
+            stats[f"{endpoint_name}_fetched"] += len(data)
+            data = []  # Limpiar lista
+
+    # Guardar resto si queda algo
+    if data:
+        save_data_batch(data, os.path.join(DATA_DIR, f"{endpoint_name}.parquet"))
+        stats[f"{endpoint_name}_fetched"] += len(data)
+
+    return data
+
+
+async def get_repo_data_async(
+    session: aiohttp.ClientSession, owner: str, repo: str
+) -> Tuple[Optional[Dict], List, List, List, List]:
+    """Versión asíncrona optimizada de get_repo_data"""
     global stats
     repo_key = f"{owner}/{repo}"
     stats["last_repo"] = repo_key
 
-    logging.info(f"🔍 Procesando {repo_key}...")
+    logging.info(f"🔍 Procesando {repo_key} (async)...")
 
-    repo_json = github_request(f"{BASE_URL}/repos/{owner}/{repo}")
+    # Obtener información básica del repositorio
+    repo_json = await github_request_async(session, f"{BASE_URL}/repos/{owner}/{repo}")
     if not repo_json:
         return None, [], [], [], []
 
@@ -331,126 +456,34 @@ def get_repo_data(owner, repo):
         "created_at": repo_json.get("created_at", ""),
         "updated_at": repo_json.get("updated_at", ""),
         "topics": ",".join(repo_json.get("topics", [])),
-        "processed": True,  # NUEVA COLUMNA: marcar como procesado
+        "processed": True,
     }
 
-    # Procesar stargazers en lotes
-    logging.info(f"⭐ Descargando stargazers de {repo_key}...")
-    stars = []
-    for batch in get_paginated_generator(
-        f"{BASE_URL}/repos/{owner}/{repo}/stargazers", max_items=MAX_ITEMS_PER_ENDPOINT
-    ):
-        for s in batch:
-            stars.append(
-                {
-                    "repo": repo_key,
-                    "user": s["user"]["login"],
-                    "timestamp": s["starred_at"],
-                }
-            )
+    # Crear tareas concurrentes para todos los endpoints
+    endpoints = [
+        (f"{BASE_URL}/repos/{owner}/{repo}/stargazers", "stargazers"),
+        (f"{BASE_URL}/repos/{owner}/{repo}/contributors", "contributors"),
+        (f"{BASE_URL}/repos/{owner}/{repo}/forks", "forks"),
+        (f"{BASE_URL}/repos/{owner}/{repo}/issues", "issues"),
+    ]
 
-        # Procesar lotes para evitar acumulación en memoria
-        if len(stars) >= BATCH_SIZE:
-            save_data_batch(stars, os.path.join(DATA_DIR, "stars.parquet"))
-            stats["stars_fetched"] += len(stars)
-            stars = []  # Limpiar lista
+    # Ejecutar todas las tareas concurrentemente
+    logging.info(
+        f"🚀 Procesando {len(endpoints)} endpoints concurrentemente para {repo_key}..."
+    )
+    tasks = []
 
-    # Guardar resto si queda algo
-    if stars:
-        save_data_batch(stars, os.path.join(DATA_DIR, "stars.parquet"))
-        stats["stars_fetched"] += len(stars)
+    for endpoint_url, endpoint_name in endpoints:
+        task = fetch_repo_endpoint(session, endpoint_url, repo_key, endpoint_name)
+        tasks.append(task)
 
-    logging.info(f"→ {stats['stars_fetched']} stargazers procesados")
-
-    # Procesar contributors en lotes
-    logging.info(f"👥 Descargando contributors de {repo_key}...")
-    contributors = []
-    for batch in get_paginated_generator(
-        f"{BASE_URL}/repos/{owner}/{repo}/contributors",
-        max_items=MAX_ITEMS_PER_ENDPOINT,
-    ):
-        for c in batch:
-            contributors.append(
-                {
-                    "repo": repo_key,
-                    "user": c["login"],
-                    "commits": c["contributions"],
-                }
-            )
-
-        if len(contributors) >= BATCH_SIZE:
-            save_data_batch(
-                contributors, os.path.join(DATA_DIR, "contributors.parquet")
-            )
-            stats["contributors_fetched"] += len(contributors)
-            contributors = []
-
-    if contributors:
-        save_data_batch(contributors, os.path.join(DATA_DIR, "contributors.parquet"))
-        stats["contributors_fetched"] += len(contributors)
-
-    logging.info(f"→ {stats['contributors_fetched']} contributors procesados")
-
-    # Procesar forks en lotes
-    logging.info(f"🍴 Descargando forks de {repo_key}...")
-    forks = []
-    for batch in get_paginated_generator(
-        f"{BASE_URL}/repos/{owner}/{repo}/forks", max_items=MAX_ITEMS_PER_ENDPOINT
-    ):
-        for f in batch:
-            forks.append(
-                {
-                    "repo": repo_key,
-                    "user": f["owner"]["login"],
-                    "timestamp": f["created_at"],
-                    "name": f["full_name"],
-                    "url": f["html_url"],
-                }
-            )
-
-        if len(forks) >= BATCH_SIZE:
-            save_data_batch(forks, os.path.join(DATA_DIR, "forks.parquet"))
-            stats["forks_fetched"] += len(forks)
-            forks = []
-
-    if forks:
-        save_data_batch(forks, os.path.join(DATA_DIR, "forks.parquet"))
-        stats["forks_fetched"] += len(forks)
-
-    logging.info(f"→ {stats['forks_fetched']} forks procesados")
-
-    # Procesar issues en lotes
-    logging.info(f"🐞 Descargando issues de {repo_key}...")
-    issues = []
-    for batch in get_paginated_generator(
-        f"{BASE_URL}/repos/{owner}/{repo}/issues",
-        params={"state": "all"},
-        max_items=MAX_ITEMS_PER_ENDPOINT,
-    ):
-        for i in batch:
-            if "pull_request" not in i:  # Filtrar PRs
-                issues.append(
-                    {
-                        "repo": repo_key,
-                        "user": i["user"]["login"],
-                        "timestamp": i["created_at"],
-                        "url": i["html_url"],
-                    }
-                )
-
-        if len(issues) >= BATCH_SIZE:
-            save_data_batch(issues, os.path.join(DATA_DIR, "issues.parquet"))
-            stats["issues_fetched"] += len(issues)
-            issues = []
-
-    if issues:
-        save_data_batch(issues, os.path.join(DATA_DIR, "issues.parquet"))
-        stats["issues_fetched"] += len(issues)
-
-    logging.info(f"→ {stats['issues_fetched']} issues procesados")
+    # Esperar a que todas las tareas se completen
+    await asyncio.gather(*tasks, return_exceptions=True)
 
     stats["repos_processed"] += 1
-    logging.info(f"✅ {repo_key} completado ({stats['repos_processed']} repos totales)")
+    logging.info(
+        f"✅ {repo_key} completado (async) - ({stats['repos_processed']} repos totales)"
+    )
 
     # Forzar garbage collection periódicamente
     if stats["repos_processed"] % FORCE_GC_EVERY == 0:
@@ -459,26 +492,14 @@ def get_repo_data(owner, repo):
             f"🧹 Garbage collection ejecutado (repo #{stats['repos_processed']})"
         )
 
-    return (
-        repo_info,
-        [],
-        [],
-        [],
-        [],
-    )  # Retornamos listas vacías ya que guardamos directamente
+    return repo_info, [], [], [], []
 
 
-def process_users_cycle():
-    """
-    NUEVA FUNCIÓN: Procesa el ciclo de usuarios
-    1. Obtiene usuarios únicos de stars.parquet
-    2. Los mueve a users.parquet
-    3. Para cada usuario, obtiene sus repositorios estrellados
-    4. Agrega nuevos repos a repos.parquet con processed=False
-    """
+async def process_users_cycle_async(session: aiohttp.ClientSession):
+    """Versión asíncrona del procesamiento de usuarios"""
     global stats
 
-    logging.info("🔄 Iniciando ciclo de procesamiento de usuarios...")
+    logging.info("🔄 Iniciando ciclo de procesamiento de usuarios (async)...")
 
     stars_path = os.path.join(DATA_DIR, "stars.parquet")
     users_path = os.path.join(DATA_DIR, "users.parquet")
@@ -520,11 +541,13 @@ def process_users_cycle():
         users_df.to_parquet(users_path, index=False, engine=PARQUET_ENGINE)
         logging.info(f"➕ Agregados {len(new_users)} usuarios nuevos")
 
-    # 3. Procesar usuarios no procesados (limitado)
-    unprocessed_users = users_df[users_df["processed"] == False]["user"].head(
-        MAX_USERS_TO_PROCESS
+    # 3. Procesar usuarios no procesados (limitado) - CONCURRENTEMENTE
+    unprocessed_users = (
+        users_df[users_df["processed"] == False]["user"]
+        .head(MAX_USERS_TO_PROCESS)
+        .tolist()
     )
-    logging.info(f"🔍 Procesando {len(unprocessed_users)} usuarios...")
+    logging.info(f"🔍 Procesando {len(unprocessed_users)} usuarios concurrentemente...")
 
     # Cargar repos existentes
     existing_repos = set()
@@ -532,25 +555,26 @@ def process_users_cycle():
         repos_df = pd.read_parquet(repos_path, engine=PARQUET_ENGINE)
         existing_repos = set(repos_df["repo"])
 
-    new_repos = []
-    processed_users = []
-
-    for user in unprocessed_users:
-
+    # Procesar usuarios concurrentemente
+    async def process_single_user(user: str) -> Tuple[str, List[Dict], int]:
+        """Procesa un usuario individual de forma asíncrona"""
         logging.info(f"👤 Procesando usuario: {user}")
 
-        # 4. Obtener repositorios estrellados por el usuario usando paginación
-        starred_batches = get_paginated_generator(f"{BASE_URL}/users/{user}/starred")
+        new_repos = []
         user_starred_count = 0
-        for batch in starred_batches:
+
+        # Obtener repositorios estrellados por el usuario usando paginación asíncrona
+        async for batch in get_paginated_async(
+            session, f"{BASE_URL}/users/{user}/starred"
+        ):
             if not batch:
                 continue
             for starred_data in batch:
                 repo_data = starred_data["repo"]
                 repo_key = repo_data["full_name"]
                 user_starred_count += 1
+
                 if repo_key not in existing_repos:
-                    # Agregar nuevo repositorio con processed=False
                     new_repo_info = {
                         "repo": repo_key,
                         "owner": repo_data["owner"]["login"],
@@ -567,21 +591,39 @@ def process_users_cycle():
                         "created_at": repo_data.get("created_at", ""),
                         "updated_at": repo_data.get("updated_at", ""),
                         "topics": ",".join(repo_data.get("topics", [])),
-                        "processed": False,  # NUEVO REPO, NO PROCESADO
+                        "processed": False,
                     }
                     new_repos.append(new_repo_info)
-                    existing_repos.add(repo_key)
-        # Actualizar stars_count para el usuario
-        users_df.loc[users_df["user"] == user, "stars_count"] = user_starred_count
+
+        return user, new_repos, user_starred_count
+
+    # Ejecutar procesamiento de usuarios concurrentemente
+    user_tasks = [process_single_user(user) for user in unprocessed_users]
+    user_results = await asyncio.gather(*user_tasks, return_exceptions=True)
+
+    # Procesar resultados
+    all_new_repos = []
+    processed_users = []
+
+    for result in user_results:
+        if isinstance(result, Exception):
+            logging.error(f"❌ Error procesando usuario: {result}")
+            continue
+
+        user, new_repos, stars_count = result
+        all_new_repos.extend(new_repos)
         processed_users.append(user)
+
+        # Actualizar stars_count para el usuario
+        users_df.loc[users_df["user"] == user, "stars_count"] = stars_count
         stats["users_processed"] += 1
-        # Rate limiting protection
-        time.sleep(1)
 
     # Guardar nuevos repos
-    if new_repos:
-        save_data_batch(new_repos, repos_path)
-        logging.info(f"🆕 Agregados {len(new_repos)} nuevos repositorios para procesar")
+    if all_new_repos:
+        save_data_batch(all_new_repos, repos_path)
+        logging.info(
+            f"🆕 Agregados {len(all_new_repos)} nuevos repositorios para procesar"
+        )
 
     # Marcar usuarios como procesados
     if processed_users:
@@ -590,20 +632,16 @@ def process_users_cycle():
         logging.info(f"✅ Marcados {len(processed_users)} usuarios como procesados")
 
     stats["last_user_processing"] = time.time()
-    logging.info("🔄 Ciclo de procesamiento de usuarios completado")
+    logging.info("🔄 Ciclo de procesamiento de usuarios completado (async)")
 
 
 def should_process_users():
-    """
-    Determina si es tiempo de procesar usuarios
-    """
+    """Determina si es tiempo de procesar usuarios"""
     return (time.time() - stats["last_user_processing"]) >= USER_PROCESSING_INTERVAL
 
 
 def get_unprocessed_repos():
-    """
-    NUEVA FUNCIÓN: Obtiene repositorios no procesados
-    """
+    """Obtiene repositorios no procesados"""
     repos_path = os.path.join(DATA_DIR, "repos.parquet")
     if not os.path.exists(repos_path):
         return []
@@ -623,9 +661,7 @@ def get_unprocessed_repos():
 
 
 def mark_repo_as_processed(repo_key):
-    """
-    NUEVA FUNCIÓN: Marca un repositorio como procesado
-    """
+    """Marca un repositorio como procesado"""
     repos_path = os.path.join(DATA_DIR, "repos.parquet")
     if not os.path.exists(repos_path):
         return
@@ -637,8 +673,46 @@ def mark_repo_as_processed(repo_key):
     gc.collect()
 
 
-if __name__ == "__main__":
-    logging.info("🚀 Iniciando scraper de GitHub con procesamiento de usuarios...")
+async def process_repos_concurrently(
+    session: aiohttp.ClientSession,
+    repos_to_process: List[Tuple[str, str]],
+    existing_set: set,
+):
+    """Procesa múltiples repositorios concurrentemente"""
+
+    async def process_single_repo(owner: str, name: str):
+        repo_key = f"{owner}/{name}"
+        try:
+            result = await get_repo_data_async(session, owner, name)
+            if result[0] is not None:
+                repo_info = result[0]
+                save_data_batch([repo_info], os.path.join(DATA_DIR, "repos.parquet"))
+                mark_repo_as_processed(repo_key)
+                existing_set.add(repo_key)
+            return True
+        except Exception as e:
+            logging.error(f"❌ Error procesando repo {repo_key}: {e}")
+            return False
+
+    # Procesar repos en lotes concurrentes
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+
+    async def bounded_process(owner: str, name: str):
+        async with semaphore:
+            return await process_single_repo(owner, name)
+
+    tasks = [bounded_process(owner, name) for owner, name in repos_to_process]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    successful = sum(1 for r in results if r is True)
+    logging.info(
+        f"✅ Procesados {successful}/{len(repos_to_process)} repositorios concurrentemente"
+    )
+
+
+async def main():
+    """Función principal asíncrona"""
+    logging.info("🚀 Iniciando scraper asíncrono de GitHub...")
     logging.info(f"📅 Fecha de inicio: {START_DATE}")
     logging.info(
         f"🔧 Límites: {MAX_ITEMS_PER_ENDPOINT} items/endpoint, lotes de {BATCH_SIZE}"
@@ -646,17 +720,18 @@ if __name__ == "__main__":
     logging.info(
         f"👥 Procesamiento de usuarios cada {USER_PROCESSING_INTERVAL/60:.0f} minutos"
     )
+    logging.info(f"🚀 Máximo requests concurrentes: {MAX_CONCURRENT_REQUESTS}")
 
     if not os.path.exists(DATA_DIR):
         os.makedirs(DATA_DIR)
 
     repos_parquet_path = os.path.join(DATA_DIR, "repos.parquet")
 
+    # Cargar repos existentes
     if os.path.exists(repos_parquet_path):
         existing_repos = pd.read_parquet(repos_parquet_path)
         if "processed" not in existing_repos.columns:
             existing_repos["processed"] = True
-
         elif existing_repos["processed"].isnull().any():
             existing_repos["processed"] = existing_repos["processed"].fillna(True)
             existing_repos.to_parquet(
@@ -664,7 +739,7 @@ if __name__ == "__main__":
             )
         existing_set = set(existing_repos["repo"])
         logging.info(f"📚 Cargados {len(existing_set)} repos existentes")
-        del existing_repos  # Liberar memoria
+        del existing_repos
         gc.collect()
     else:
         existing_set = set()
@@ -672,65 +747,77 @@ if __name__ == "__main__":
 
     last_progress_log = time.time()
 
-    try:
-        while True:
-            # NUEVO: Verificar si es tiempo de procesar usuarios
-            if time.time() - stats["last_backup"] > BACKUP_TIMEOUT:
-                backup_data_folder()
-            if should_process_users():
-                process_users_cycle()
+    # Configurar sesión HTTP asíncrona
+    timeout = aiohttp.ClientTimeout(total=30, connect=10)
+    connector = aiohttp.TCPConnector(
+        limit=MAX_CONCURRENT_REQUESTS, limit_per_host=SEMAPHORE_LIMIT
+    )
 
-            # NUEVO: Procesar repositorios no procesados primero
-            unprocessed_repos = get_unprocessed_repos()
-            if unprocessed_repos:
-                logging.info(
-                    f"🔄 Procesando {len(unprocessed_repos)} repositorios pendientes..."
+    try:
+        async with aiohttp.ClientSession(
+            headers=HEADERS, timeout=timeout, connector=connector
+        ) as session:
+
+            while True:
+                # Verificar si es tiempo de crear backup
+                if time.time() - stats["last_backup"] > BACKUP_TIMEOUT:
+                    backup_data_folder()
+
+                # Verificar si es tiempo de procesar usuarios
+                if should_process_users():
+                    await process_users_cycle_async(session)
+
+                # Procesar repositorios no procesados primero
+                unprocessed_repos = get_unprocessed_repos()
+                if unprocessed_repos:
+                    logging.info(
+                        f"🔄 Procesando {len(unprocessed_repos)} repositorios pendientes concurrentemente..."
+                    )
+
+                    # Procesar en lotes para no sobrecargar
+                    batch_size = min(MAX_CONCURRENT_REQUESTS, len(unprocessed_repos))
+                    for i in range(0, len(unprocessed_repos), batch_size):
+                        batch = unprocessed_repos[i : i + batch_size]
+                        await process_repos_concurrently(session, batch, existing_set)
+
+                        update_status()
+
+                        if time.time() - last_progress_log > 300:
+                            log_progress()
+                            last_progress_log = time.time()
+
+                        # Pequeña pausa entre lotes para no saturar la API
+                        await asyncio.sleep(2)
+
+                    continue  # Volver al inicio del loop para verificar más repos pendientes
+
+                # Continuar con el flujo normal si no hay repos pendientes
+                logging.info(f"📖 Procesando página {stats['pages_processed']}...")
+                repos = await get_repos_by_topic_async(
+                    session, "python", per_page=10, page=stats["pages_processed"]
                 )
-                for owner, name in unprocessed_repos:
+
+                if not repos:
+                    logging.info("🏁 No hay más repositorios para procesar")
+                    break
+
+                # Filtrar repos que ya existen
+                new_repos = []
+                for r in repos:
+                    owner, name = r["owner"]["login"], r["name"]
                     repo_key = f"{owner}/{name}"
 
-                    result = get_repo_data(owner, name)
-                    if result[0] is not None:
-                        repo_info = result[0]
-                        save_data_batch([repo_info], repos_parquet_path)
-                        mark_repo_as_processed(repo_key)
-                        existing_set.add(repo_key)
+                    if repo_key not in existing_set:
+                        new_repos.append((owner, name))
+                    else:
+                        logging.info(f"⏭️ {repo_key} ya existe, saltando")
 
-                    update_status()
-
-                    if time.time() - last_progress_log > 300:
-                        log_progress()
-                        last_progress_log = time.time()
-
-                continue  # Volver al inicio del loop para verificar más repos pendientes
-
-            # Continuar con el flujo normal si no hay repos pendientes
-            logging.info(f"📖 Procesando página {stats['pages_processed']}...")
-            repos = get_repos_by_topic(
-                "python", per_page=10, page=stats["pages_processed"]
-            )
-
-            if not repos:
-                logging.info("🏁 No hay más repositorios para procesar")
-                break
-
-            for r in repos:
-                owner, name = r["owner"]["login"], r["name"]
-                repo_key = f"{owner}/{name}"
-
-                if repo_key in existing_set:
-                    logging.info(f"⏭️ {repo_key} ya existe, saltando")
-                    continue
-
-                result = get_repo_data(owner, name)
-                if result[0] is None:
-                    continue
-
-                repo_info = result[0]
-
-                # Guardar repo info
-                save_data_batch([repo_info], repos_parquet_path)
-                existing_set.add(repo_key)
+                # Procesar nuevos repos concurrentemente
+                if new_repos:
+                    logging.info(
+                        f"🚀 Procesando {len(new_repos)} nuevos repositorios concurrentemente..."
+                    )
+                    await process_repos_concurrently(session, new_repos, existing_set)
 
                 update_status()
 
@@ -738,9 +825,8 @@ if __name__ == "__main__":
                     log_progress()
                     last_progress_log = time.time()
 
-            stats["pages_processed"] += 1
-
-            time.sleep(2)
+                stats["pages_processed"] += 1
+                await asyncio.sleep(2)  # Pausa entre páginas
 
     except KeyboardInterrupt:
         logging.info("🛑 Interrupción manual detectada")
@@ -752,3 +838,14 @@ if __name__ == "__main__":
         update_status()
         log_progress()
         logging.info("🏁 Script finalizado")
+
+
+if __name__ == "__main__":
+    # Ejecutar el loop asíncrono principal
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logging.info("🛑 Interrupción recibida, cerrando...")
+    except Exception as e:
+        logging.error(f"💥 Error crítico: {e}")
+        raise
