@@ -165,9 +165,7 @@ def github_request(url, params=None, retries=3):
 
 
 def get_paginated_generator(url, params=None, max_items=None):
-    """
-    Generador que yield páginas en lugar de acumular todo en memoria
-    """
+    global stats
     page = 1
     items_fetched = 0
 
@@ -177,8 +175,23 @@ def get_paginated_generator(url, params=None, max_items=None):
         params["per_page"] = 100
 
         logging.info(f"[get_paginated_generator] Página {page} - URL: {url}")
+
+        # Hacer la llamada directamente para obtener headers
         resp = requests.get(url, headers=HEADERS, params=params)
         stats["api_calls"] += 1
+
+        # Control de rate limiting manual
+        remaining = resp.headers.get("X-RateLimit-Remaining")
+        reset = resp.headers.get("X-RateLimit-Reset")
+
+        if remaining and int(remaining) <= 0:
+            stats["rate_limits"] += 1
+            reset_time = int(reset) if reset else time.time() + 60
+            sleep_time = max(reset_time - int(time.time()), 60)
+            logging.warning(f"💤 Rate limit en generador. Durmiendo {sleep_time}s...")
+            update_status()
+            time.sleep(sleep_time)
+            continue
 
         if not resp.ok:
             logging.error(f"❌ Error en paginación: status {resp.status_code}")
@@ -197,14 +210,22 @@ def get_paginated_generator(url, params=None, max_items=None):
         if not batch or (max_items and items_fetched >= max_items):
             break
 
-        # Link header para siguiente página
+        # Usar Link header para siguiente página
         links = resp.headers.get("Link", "")
         next_url = None
         for part in links.split(","):
             if 'rel="next"' in part:
                 next_url = part[part.find("<") + 1 : part.find(">")]
+
         url = next_url
         page += 1
+
+        # Seguridad: evitar bucles infinitos
+        if page > 1000:
+            logging.warning(
+                f"⚠️ Alcanzado límite de seguridad de páginas, deteniendo..."
+            )
+            break
 
 
 def save_data_batch(data_list, file_path, columns=None):
