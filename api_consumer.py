@@ -133,9 +133,8 @@ def github_request(url, params=None, retries=3):
         limit = resp.headers.get("X-RateLimit-Limit")
         remaining = resp.headers.get("X-RateLimit-Remaining")
         reset = resp.headers.get("X-RateLimit-Reset")
-
+        stats["rate_limits"] = remaining
         if remaining and int(remaining) <= 0:
-            stats["rate_limits"] += 1
             reset_time = int(reset) if reset else time.time() + 60
             sleep_time = max(reset_time - int(time.time()), 60)
             logging.warning(f"💤 Rate limit en generador. Durmiendo {sleep_time}s...")
@@ -174,9 +173,9 @@ def get_paginated_generator(url, params=None, max_items=None):
         # Control de rate limiting manual
         remaining = resp.headers.get("X-RateLimit-Remaining")
         reset = resp.headers.get("X-RateLimit-Reset")
+        stats["rate_limits"] = remaining
 
         if remaining and int(remaining) <= 0:
-            stats["rate_limits"] += 1
             reset_time = int(reset) if reset else time.time() + 60
             sleep_time = max(reset_time - int(time.time()), 60)
             logging.warning(f"💤 Rate limit en generador. Durmiendo {sleep_time}s...")
