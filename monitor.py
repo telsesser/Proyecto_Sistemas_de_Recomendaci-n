@@ -1,171 +1,177 @@
 #!/usr/bin/env python3
 """
-Script para monitorear el progreso del scraper de GitHub
-Uso: python monitor.py [--watch]
+Monitor simple para el scraper de GitHub
+Uso: python monitor.py [--watch] [--interval 5]
 """
 
 import json
 import os
 import time
 import argparse
-from datetime import datetime, timedelta
+import sys
+from datetime import datetime
 
 
-def load_status():
-    """Carga el archivo de estado"""
-    status_file = "data/status.json"
-    if not os.path.exists(status_file):
-        return None
-
-    try:
-        with open(status_file, "r") as f:
-            return json.load(f)
-    except Exception as e:
-        print(f"❌ Error leyendo status: {e}")
-        return None
+def clear_screen():
+    """Limpia la pantalla"""
+    os.system("cls" if os.name == "nt" else "clear")
 
 
-def format_duration(seconds):
-    """Formatea duración en formato legible"""
-    if seconds < 60:
-        return f"{seconds:.0f}s"
-    elif seconds < 3600:
-        return f"{seconds//60:.0f}m {seconds%60:.0f}s"
+def format_bytes(bytes_val):
+    """Convierte bytes a formato legible"""
+    for unit in ["B", "KB", "MB", "GB"]:
+        if bytes_val < 1024.0:
+            return f"{bytes_val:.1f} {unit}"
+        bytes_val /= 1024.0
+    return f"{bytes_val:.1f} TB"
+
+
+def get_file_info(filepath):
+    """Obtiene info de un archivo parquet"""
+    if not os.path.exists(filepath):
+        return {"exists": False, "size": 0, "size_str": "0 B", "modified": "N/A"}
+
+    stat = os.stat(filepath)
+    size = stat.st_size
+    modified = datetime.fromtimestamp(stat.st_mtime).strftime("%H:%M:%S")
+
+    return {
+        "exists": True,
+        "size": size,
+        "size_str": format_bytes(size),
+        "modified": modified,
+    }
+
+
+def show_status():
+    """Muestra el estado actual del scraper"""
+    data_dir = "data"
+    status_file = os.path.join(data_dir, "status.json")
+    log_file = os.path.join(data_dir, "api_consumer.log")
+
+    # Leer status.json
+    if os.path.exists(status_file):
+        try:
+            with open(status_file, "r") as f:
+                status = json.load(f)
+        except (json.JSONDecodeError, FileNotFoundError):
+            status = {"error": "No se pudo leer status.json"}
     else:
-        hours = seconds // 3600
-        minutes = (seconds % 3600) // 60
-        return f"{hours:.0f}h {minutes:.0f}m"
+        status = {"error": "status.json no encontrado"}
 
+    # Info de archivos
+    files = {
+        "repos": get_file_info(os.path.join(data_dir, "repos.parquet")),
+        "stars": get_file_info(os.path.join(data_dir, "stars.parquet")),
+        "contributors": get_file_info(os.path.join(data_dir, "contributors.parquet")),
+        "forks": get_file_info(os.path.join(data_dir, "forks.parquet")),
+        "issues": get_file_info(os.path.join(data_dir, "issues.parquet")),
+    }
 
-def check_log_size():
-    """Verifica el tamaño del archivo de log"""
-    log_file = "data/api_consumer.log"
+    # Últimas líneas del log
+    log_lines = []
     if os.path.exists(log_file):
-        size_mb = os.path.getsize(log_file) / 1024 / 1024
-        return size_mb
-    return 0
+        try:
+            with open(log_file, "r", encoding="utf-8") as f:
+                log_lines = f.readlines()[-5:]  # Últimas 5 líneas
+        except:
+            log_lines = ["Error leyendo log"]
 
-
-def get_recent_errors():
-    """Obtiene errores recientes del log"""
-    log_file = "data/api_consumer.log"
-    if not os.path.exists(log_file):
-        return []
-
-    errors = []
-    try:
-        with open(log_file, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-            # Obtener últimas 50 líneas
-            for line in lines[-50:]:
-                if "[ERROR]" in line or "❌" in line:
-                    errors.append(line.strip())
-    except Exception:
-        pass
-
-    return errors[-5:]  # Últimos 5 errores
-
-
-def display_status(status_data):
-    """Muestra el estado actual"""
-    if not status_data:
-        print("❌ No se puede leer el archivo de estado")
-        return
-
-    print("=" * 60)
-    print("📊 ESTADO DEL SCRAPER DE GITHUB")
-    print("=" * 60)
-
-    # Información básica
-    timestamp = datetime.fromisoformat(status_data["timestamp"])
-    now = datetime.now()
-    time_since_update = (now - timestamp).total_seconds()
-
-    print(f"🕒 Última actualización: {timestamp.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"⏰ Hace: {format_duration(time_since_update)}")
-
-    if time_since_update > 600:  # 10 minutos
-        print("⚠️  WARNING: Hace más de 10 minutos sin actualización")
-
+    print("=" * 80)
+    print("🔍 MONITOR GITHUB SCRAPER")
+    print("=" * 80)
+    print(f"⏰ Actualizado: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print()
 
-    # Estadísticas principales
-    print("📈 ESTADÍSTICAS:")
-    print(f"   Repos procesados: {status_data['repos_processed']:,}")
-    print(f"   Páginas procesadas: {status_data['pages_processed']:,}")
-    print(f"   Llamadas API: {status_data['api_calls']:,}")
-    print(f"   Errores: {status_data['errors']:,}")
-    print(f"   Rate limits: {status_data['rate_limits']:,}")
-    print(f"   Último repo: {status_data['last_repo']}")
-    print()
-
-    # Tiempo y rendimiento
-    print("⏱️ RENDIMIENTO:")
-    print(f"   Tiempo corriendo: {status_data['runtime_formatted']}")
-    print(f"   Repos/hora: {status_data['avg_repos_per_hour']:.1f}")
-    print(f"   API calls/min: {status_data['avg_api_calls_per_minute']:.1f}")
-    print()
-
-    # Estado del log
-    log_size = check_log_size()
-    print(f"📝 Log: {log_size:.1f} MB")
-    if log_size > 100:
-        print("⚠️  WARNING: Log muy grande, considera rotarlo")
-    print()
-
-    # Errores recientes
-    recent_errors = get_recent_errors()
-    if recent_errors:
-        print("🚨 ERRORES RECIENTES:")
-        for error in recent_errors:
-            print(f"   {error}")
+    if "error" in status:
+        print(f"❌ ERROR: {status['error']}")
+        print()
+    else:
+        # Estado general
+        print("📊 ESTADÍSTICAS GENERALES")
+        print("-" * 40)
+        print(f"🏃 Runtime:           {status.get('runtime_formatted', 'N/A')}")
+        print(f"📦 Repos procesados:  {status.get('repos_processed', 0):,}")
+        print(f"📄 Páginas:           {status.get('pages_processed', 0):,}")
+        print(f"🌐 API calls:         {status.get('api_calls', 0):,}")
+        print(f"❌ Errores:           {status.get('errors', 0):,}")
+        print(f"⏸️ Rate limits:       {status.get('rate_limits', 0):,}")
+        print(f"📈 Repos/hora:        {status.get('avg_repos_per_hour', 0):.1f}")
+        print(f"📈 Calls/minuto:      {status.get('avg_api_calls_per_minute', 0):.1f}")
+        print(f"🎯 Último repo:       {status.get('last_repo', 'N/A')}")
         print()
 
-    # Estimaciones
-    if status_data["avg_repos_per_hour"] > 0:
-        # Estimación muy aproximada basada en búsqueda de GitHub
-        estimated_total = 100000  # Estimación conservadora de repos Python
-        remaining = max(0, estimated_total - status_data["repos_processed"])
-        if remaining > 0 and status_data["avg_repos_per_hour"] > 0:
-            eta_hours = remaining / status_data["avg_repos_per_hour"]
-            eta = now + timedelta(hours=eta_hours)
-            print("🎯 ESTIMACIONES:")
-            print(f"   Repos restantes: ~{remaining:,}")
-            print(f"   ETA: ~{eta.strftime('%Y-%m-%d %H:%M')}")
-            print(f"   Tiempo restante: ~{format_duration(eta_hours * 3600)}")
+        # Datos recolectados
+        print("🗃️ DATOS RECOLECTADOS")
+        print("-" * 40)
+        print(f"⭐ Stars:            {status.get('stars_fetched', 0):,}")
+        print(f"👥 Contributors:     {status.get('contributors_fetched', 0):,}")
+        print(f"🍴 Forks:            {status.get('forks_fetched', 0):,}")
+        print(f"🐞 Issues:           {status.get('issues_fetched', 0):,}")
+        print()
 
-    print("=" * 60)
-
-
-def watch_mode():
-    """Modo watch - actualiza cada 30 segundos"""
-    print("👁️  Modo watch activado (Ctrl+C para salir)")
+    # Archivos
+    print("📁 ARCHIVOS PARQUET")
+    print("-" * 40)
+    total_size = 0
+    for name, info in files.items():
+        if info["exists"]:
+            print(f"{name:12} │ {info['size_str']:>8} │ {info['modified']}")
+            total_size += info["size"]
+        else:
+            print(f"{name:12} │     N/A  │   N/A")
+    print("-" * 40)
+    print(f"{'TOTAL':12} │ {format_bytes(total_size):>8} │")
     print()
 
+    # Log reciente
+    print("📝 LOG RECIENTE (últimas 5 líneas)")
+    print("-" * 60)
+    if log_lines:
+        for line in log_lines:
+            # Limpiar y truncar líneas muy largas
+            clean_line = line.strip()
+            if len(clean_line) > 75:
+                clean_line = clean_line[:72] + "..."
+            print(clean_line)
+    else:
+        print("No hay logs disponibles")
+
+    print("=" * 80)
+
+
+def monitor_loop(interval):
+    """Loop de monitoreo continuo"""
     try:
         while True:
-            os.system("clear" if os.name == "posix" else "cls")
-            status_data = load_status()
-            display_status(status_data)
-            print("\n🔄 Actualizando en 30 segundos...")
-            time.sleep(30)
+            clear_screen()
+            show_status()
+            print(f"\n🔄 Actualizando cada {interval} segundos... (Ctrl+C para salir)")
+            time.sleep(interval)
     except KeyboardInterrupt:
-        print("\n👋 Saliendo del modo watch")
+        print("\n👋 Monitor detenido")
+        sys.exit(0)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Monitor del scraper de GitHub")
+    parser = argparse.ArgumentParser(description="Monitor para GitHub scraper")
     parser.add_argument(
-        "--watch", action="store_true", help="Modo watch - actualiza cada 30 segundos"
+        "--watch", "-w", action="store_true", help="Modo watch continuo"
+    )
+    parser.add_argument(
+        "--interval",
+        "-i",
+        type=int,
+        default=5,
+        help="Intervalo en segundos para --watch (default: 5)",
     )
 
     args = parser.parse_args()
 
     if args.watch:
-        watch_mode()
+        monitor_loop(args.interval)
     else:
-        status_data = load_status()
-        display_status(status_data)
+        show_status()
 
 
 if __name__ == "__main__":
