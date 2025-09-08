@@ -10,6 +10,7 @@ from datetime import datetime
 import signal
 import sys
 import gc  # Garbage collector
+import shutil
 
 load_dotenv()
 
@@ -25,6 +26,9 @@ FORCE_GC_EVERY = 3  # Forzar garbage collection cada N repos
 # NUEVA CONFIGURACIÓN: Tiempo para procesar usuarios (en segundos)
 USER_PROCESSING_INTERVAL = 360
 MAX_USERS_TO_PROCESS = 10  # Máximo usuarios a procesar por ciclo
+
+# NUEVA CONFIGURACIÓN: Tiempo de espera para copias de seguridad (en segundos)
+BACKUP_TIMEOUT = 3600  # 1 hora
 
 
 # Configuración de logging
@@ -45,6 +49,8 @@ if os.path.exists(STATUS_FILE):
             if stats.get("users_processed") is None:
                 stats["users_processed"] = 0
                 stats["last_user_processing"] = 0
+            if stats.get("last_backup") is None:
+                stats["last_backup"] = 0
         except json.JSONDecodeError:
             logging.error(
                 "Error al leer el archivo de estado. Se utilizarán valores predeterminados."
@@ -66,6 +72,7 @@ if not stats:
         "issues_fetched": 0,
         "users_processed": 0,
         "last_user_processing": 0,
+        "last_backup": 0,
     }
 
 logging.basicConfig(
@@ -148,6 +155,18 @@ def signal_handler(signum, frame):
 
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
+
+
+def backup_data_folder():
+    """Crea una copia de seguridad de la carpeta de datos"""
+    global stats
+    backup_dir = f"{DATA_DIR}_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    try:
+        shutil.copytree(DATA_DIR, backup_dir)
+        logging.info(f"💾 Copia de seguridad creada en {backup_dir}")
+        stats["last_backup"] = time.time()
+    except Exception as e:
+        logging.error(f"❌ Error al crear copia de seguridad: {e}")
 
 
 def github_request(url, params=None, retries=3):
@@ -514,6 +533,7 @@ def process_users_cycle():
     processed_users = []
 
     for user in unprocessed_users:
+
         logging.info(f"👤 Procesando usuario: {user}")
 
         # 4. Obtener repositorios estrellados por el usuario usando paginación
@@ -642,6 +662,8 @@ if __name__ == "__main__":
     try:
         while True:
             # NUEVO: Verificar si es tiempo de procesar usuarios
+            if time.time() - stats["last_backup"] > BACKUP_TIMEOUT:
+                backup_data_folder()
             if should_process_users():
                 process_users_cycle()
 
