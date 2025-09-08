@@ -500,13 +500,15 @@ async def process_users_cycle_async(session: aiohttp.ClientSession):
 
     logging.info("🔄 Iniciando ciclo de procesamiento de usuarios (async)...")
 
-    stars_path = os.path.join(DATA_DIR, "stars.parquet")
+    stars_path = os.path.join(DATA_DIR, "stargazers.parquet")
     users_path = os.path.join(DATA_DIR, "users.parquet")
     repos_path = os.path.join(DATA_DIR, "repos.parquet")
 
-    # 1. Obtener usuarios únicos de stars.parquet
+    # 1. Obtener usuarios únicos de stargazers.parquet
     if not os.path.exists(stars_path):
-        logging.info("⚠️ No existe stars.parquet, saltando procesamiento de usuarios")
+        logging.info(
+            "⚠️ No existe stargazers.parquet, saltando procesamiento de usuarios"
+        )
         return
 
     # Usar duckdb para obtener usuarios únicos sin cargar todo el parquet en memoria
