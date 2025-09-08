@@ -497,7 +497,9 @@ def process_users_cycle():
         logging.info(f"➕ Agregados {len(new_users)} usuarios nuevos")
 
     # 3. Procesar usuarios no procesados (limitado)
-    unprocessed_users = users_df[users_df["processed"] == False]["user"]
+    unprocessed_users = users_df[users_df["processed"] == False]["user"].head(
+        MAX_USERS_TO_PROCESS
+    )
     logging.info(f"🔍 Procesando {len(unprocessed_users)} usuarios...")
 
     # Cargar repos existentes
