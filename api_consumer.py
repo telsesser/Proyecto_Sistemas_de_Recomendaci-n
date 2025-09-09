@@ -988,10 +988,8 @@ async def main():
                         for i in range(0, len(unprocessed_repos), batch_size):
                             batch = unprocessed_repos[i : i + batch_size]
                             logging.info(f"🚀 Procesando repositorios: {batch}")
-                            await process_repos_concurrently(session, batch)
-
                             update_status()
-
+                            await process_repos_concurrently(session, batch)
                             if time.time() - last_progress_log > 300:
                                 log_progress()
                                 last_progress_log = time.time()
