@@ -62,7 +62,7 @@ if os.path.exists(STATUS_FILE):
             stats["pages_processed"] = 0  # paginas de pantalla principal de github
             stats["pages_fetched"] = 0  # paginas de pagination
             stats["api_calls"] = 0
-            if stats["all_users"] is None:
+            if stats.get("all_users") is None:
                 stats["all_users"] = 0
             if stats.get("all_repos_processed") is None:
                 stats["all_repos_processed"] = 0
