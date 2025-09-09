@@ -29,7 +29,7 @@ FORCE_GC_EVERY = 3  # Forzar garbage collection cada N repos
 
 # Tiempo para procesar usuarios (en segundos)
 USER_PROCESSING_INTERVAL = 360
-MAX_USERS_TO_PROCESS = 2  # Máximo usuarios a procesar por ciclo
+MAX_USERS_TO_PROCESS = 4  # Máximo usuarios a procesar por ciclo
 
 # Tiempo de espera para copias de seguridad (en segundos)
 BACKUP_TIMEOUT = 3600  # 1 hora
@@ -62,17 +62,7 @@ if os.path.exists(STATUS_FILE):
             stats["pages_processed"] = 0  # paginas de pantalla principal de github
             stats["pages_fetched"] = 0  # paginas de pagination
             stats["api_calls"] = 0
-            if stats.get("all_users") is None:
-                stats["all_users"] = 0
-            if stats.get("all_repos_processed") is None:
-                stats["all_repos_processed"] = 0
-            if stats.get("repos_fetched") is None:
-                stats["repos_fetched"] = 0
-            if stats.get("users_processed") is None:
-                stats["users_processed"] = 0
-                stats["last_user_processing"] = 0
-            if stats.get("last_backup") is None:
-                stats["last_backup"] = 0
+            stats["last_backup"] = 0
         except json.JSONDecodeError:
             logging.error(
                 "Error al leer el archivo de estado. Se utilizarán valores predeterminados."
@@ -395,9 +385,9 @@ def update_processed_users(users: List[int]):
     conn = get_db_conn()
     cur = conn.cursor()
     cur.executemany(
-        "UPDATE users SET processed=1 WHERE id_user=?",
-        [(u,) for u in users],
+        "UPDATE users SET processed=1 WHERE id_user=?", [(u,) for u in users]
     )
+
     conn.commit()
     conn.close()
 
@@ -937,7 +927,7 @@ async def process_users_cycle_async(session: aiohttp.ClientSession):
                         }
                     )
 
-            return user, new_repos, user_starred_count, starred_repos
+            return id_user, new_repos, user_starred_count, starred_repos
 
         except Exception as e:
             logging.error(
@@ -966,12 +956,12 @@ async def process_users_cycle_async(session: aiohttp.ClientSession):
             logging.error(f"❌ Error procesando usuario: {result}")
             continue
 
-        user, new_repos, stars_count, starred_repos = result
+        id_user, new_repos, stars_count, starred_repos = result
         all_new_repos.extend(new_repos)
-        processed_users.append(user)
+        processed_users.append(id_user)
 
         # Actualizar stars_count para el usuario
-        add_user_stars_count(user, stars_count)
+        add_user_stars_count(id_user, stars_count)
 
         # Guardar repositorios estrellados en la base de datos
         if starred_repos:
@@ -1049,7 +1039,7 @@ async def main():
     # Inicializar base de datos
     init_db()
     load_stats_from_db()
-
+    update_status()
     if not os.path.exists(DATA_DIR):
         os.makedirs(DATA_DIR)
 
@@ -1085,7 +1075,7 @@ async def main():
                         await process_users_cycle_async(session)
 
                     # Procesar repositorios no procesados primero (usar BD si está disponible)
-                    unprocessed_repos = get_unprocessed_repos_db(100)
+                    unprocessed_repos = get_unprocessed_repos_db(2)
 
                     if unprocessed_repos:
                         logging.info(
