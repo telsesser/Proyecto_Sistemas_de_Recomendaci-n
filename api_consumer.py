@@ -446,7 +446,7 @@ async def handle_rate_limit(response_headers: dict) -> bool:
     if remaining:
         stats["rate_limits"] = int(remaining)
 
-        if int(remaining) <= 10:
+        if int(remaining) <= 5:
             reset_time = int(reset) if reset else time.time() + 60
             sleep_time = max(reset_time - int(time.time()), 60)
             logging.warning(
@@ -517,7 +517,6 @@ async def github_request_async(
                     rate_limited = await handle_rate_limit(resp.headers)
                     if rate_limited:
                         continue  # Reintentar después del sleep
-
                     if resp.status == 200:
                         return await resp.json()
                     elif resp.status == 403:
@@ -567,9 +566,6 @@ async def get_paginated_async(
                 async with request_semaphore:
                     async with session.get(current_url, params=page_params) as resp:
                         stats["api_calls"] += 1
-                        rate_limited = await handle_rate_limit(resp.headers)
-                        if rate_limited:
-                            continue  # Salir del bucle de reintentos, continuar con siguiente página
                         text = await resp.text()
                 batch = orjson.loads(text)
                 # Limitar items si se especifica max_items
@@ -597,7 +593,10 @@ async def get_paginated_async(
                 if page > 5000:
                     logging.warning(f"⚠️ Alcanzado límite de páginas, deteniendo...")
                     return
-                break  # Éxito, salir del bucle de reintentos
+                rate_limited = await handle_rate_limit(resp.headers)
+                if rate_limited:
+                    continue
+                break
 
             except Exception as e:
                 if attempt == MAX_RETRIES - 1:  # Último intento
