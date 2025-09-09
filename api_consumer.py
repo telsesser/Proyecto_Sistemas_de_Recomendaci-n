@@ -674,7 +674,7 @@ async def get_repo_data_async(
         if isinstance(result, Exception):
             endpoint_name = endpoints[i][1]
             logging.error(
-                f"❌ Error en endpoint {endpoint_name} para {repo_key}: {result}"
+                f"❌ Error en endpoint {endpoint_name} para {repo_key}", exc_info=result
             )
 
     stats["repos_processed"] += 1
