@@ -44,11 +44,11 @@ MAX_USERS_TO_PROCESS = 2  # Máximo usuarios a procesar por ciclo
 BACKUP_TIMEOUT = 3600  # 1 hora
 
 # CONFIGURACIÓN ASÍNCRONA
-MAX_CONCURRENT_REQUESTS = 10  # Máximo requests concurrentes
-SEMAPHORE_LIMIT = 5  # limite de conexiones simultaneas a la API
+MAX_CONCURRENT_REQUESTS = 4  # Máximo requests concurrentes
+SEMAPHORE_LIMIT = 2  # limite de conexiones simultaneas a la API
 REPOS_BATCH_SIZE = 4  # Número de repos a procesar en paralelo
 SEMAPHORE_REPO_LIMIT = 2  # Límite DE procesamiento de repositorios en simultáneo
-SEMAPHORE_USER_LIMIT = 5  # Límite de procesamiento de usuarios en simultáneo
+SEMAPHORE_USER_LIMIT = 2  # Límite de procesamiento de usuarios en simultáneo
 
 REQUEST_DELAY = 0.5  # Aumentado para evitar rate limiting
 
