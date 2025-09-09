@@ -42,7 +42,7 @@ BACKUP_TIMEOUT = 3600  # 1 hora
 
 # CONFIGURACIÓN ASÍNCRONA
 MAX_CONCURRENT_REQUESTS = 4  # Reducido para evitar rate limiting
-SEMAPHORE_LIMIT = 2  # Reducido para mayor estabilidad
+SEMAPHORE_LIMIT = 4  # Reducido para mayor estabilidad
 REQUEST_DELAY = 0.5  # Aumentado para evitar rate limiting
 
 # Configuración de logging
@@ -863,7 +863,11 @@ async def main():
     last_progress_log = time.time()
 
     # Configurar sesión HTTP asíncrona con timeouts más generosos
-    timeout = aiohttp.ClientTimeout(total=60, connect=60)
+    timeout = aiohttp.ClientTimeout(
+        total=60,  # tiempo máximo total para la request
+        sock_connect=30,  # tiempo para conectar
+        sock_read=30,  # tiempo para leer la respuesta
+    )
     connector = aiohttp.TCPConnector(
         limit=MAX_CONCURRENT_REQUESTS,
         limit_per_host=SEMAPHORE_LIMIT,
