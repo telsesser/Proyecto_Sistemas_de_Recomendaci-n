@@ -13,13 +13,13 @@ if [ ! -z "$PID" ]; then
     echo "🛑 Terminando proceso..."
     kill $PID
     
-    # Esperar hasta 10 segundos para terminación graceful
-    for i in {1..10}; do
+    # Esperar hasta 20 segundos para terminación graceful
+    for i in {1..20}; do
         if ! kill -0 $PID 2>/dev/null; then
             echo "✅ Proceso terminado gracefully"
             break
         fi
-        echo "⏳ Esperando terminación... ($i/10)"
+        echo "⏳ Esperando terminación... ($i/20)"
         sleep 1
     done
     

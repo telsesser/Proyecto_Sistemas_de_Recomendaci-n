@@ -44,7 +44,7 @@ BACKUP_TIMEOUT = 3600  # 1 hora
 
 # CONFIGURACIÓN ASÍNCRONA
 MAX_CONCURRENT_REQUESTS = 2  # Reducido para evitar rate limiting
-SEMAPHORE_LIMIT = 2  # Reducido para mayor estabilidad
+SEMAPHORE_LIMIT = 1  # Reducido para mayor estabilidad
 REQUEST_DELAY = 0.5  # Aumentado para evitar rate limiting
 
 # Configuración de logging
@@ -837,7 +837,7 @@ async def process_repos_concurrently(
             return False
 
     # Procesar repos en lotes concurrentes
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+    semaphore = asyncio.Semaphore(SEMAPHORE_LIMIT)
 
     async def bounded_process(name: str):
         async with semaphore:
@@ -914,7 +914,7 @@ async def main():
 
                         # Procesar en lotes pequeños para no sobrecargar
                         batch_size = min(
-                            5, len(unprocessed_repos)
+                            MAX_CONCURRENT_REQUESTS, len(unprocessed_repos)
                         )  # Lotes más pequeños
                         for i in range(0, len(unprocessed_repos), batch_size):
                             batch = unprocessed_repos[i : i + batch_size]
