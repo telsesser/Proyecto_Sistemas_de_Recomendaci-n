@@ -237,7 +237,6 @@ def init_db():
     )
 
     ## delete users table
-    cur.execute("DROP TABLE IF EXISTS users")
     cur.execute(
         """
     CREATE TABLE IF NOT EXISTS users (
