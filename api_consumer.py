@@ -596,6 +596,9 @@ async def fetch_repo_endpoint(
             except KeyError as e:
                 logging.error(f"❌ Error procesando item en {endpoint_name}: {e}")
                 continue
+            except Exception as e:
+                logging.error(f"❌ Error inesperado en {endpoint_name}: {e}")
+                continue
 
         # Procesar en lotes para evitar acumulación en memoria
         if len(data) >= BATCH_SIZE:
