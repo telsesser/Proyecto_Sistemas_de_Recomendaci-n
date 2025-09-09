@@ -13,6 +13,8 @@ import gc  # Garbage collector
 import shutil
 from typing import List, Dict, Optional, Tuple, AsyncGenerator
 import sqlite3
+import traceback
+
 
 load_dotenv()
 
@@ -485,19 +487,14 @@ async def get_paginated_async(
                     if page > 5000:
                         logging.warning(f"⚠️ Alcanzado límite de páginas, deteniendo...")
                         return
-
                     break  # Éxito, salir del bucle de reintentos
 
             except Exception as e:
                 if attempt == MAX_RETRIES - 1:  # Último intento
                     logging.error(
-                        f"❌ Página {page} falló después de {MAX_RETRIES} intentos: {str(e)}"
+                        f"❌ Página {page} falló después de {MAX_RETRIES} intentos:"
                     )
                     raise
-
-                logging.warning(
-                    f"⚠️ Página {page}, intento {attempt + 1} falló: {str(e)}. Reintentando..."
-                )
                 await asyncio.sleep(2**attempt)  # 1s, 2s, 4s
 
 
@@ -687,7 +684,10 @@ async def get_repo_data_async(
     for i, result in enumerate(results):
         if isinstance(result, Exception):
             endpoint_name = endpoints[i][1]
-            logging.error(f"❌ Error en endpoint {endpoint_name} para {repo_key}")
+            logging.error(
+                f"❌ Error en endpoint {endpoint_name} para {repo_key}\n"
+                f"{''.join(traceback.format_exception(type(result), result, result.__traceback__))}"
+            )
 
     stats["repos_processed"] += 1
     logging.info(
