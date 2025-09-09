@@ -14,6 +14,7 @@ import shutil
 from typing import List, Dict, Optional, Tuple, AsyncGenerator
 import sqlite3
 import traceback
+import orjson
 
 
 load_dotenv()
@@ -540,8 +541,8 @@ async def get_paginated_async(
                         rate_limited = await handle_rate_limit(resp.headers)
                         if rate_limited:
                             continue  # Salir del bucle de reintentos, continuar con siguiente página
-                        batch = await resp.json()
-
+                        text = await resp.text()
+                batch = orjson.loads(text)
                 # Limitar items si se especifica max_items
                 if max_items and items_fetched + len(batch) > max_items:
                     batch = batch[: max_items - items_fetched]
@@ -910,7 +911,7 @@ async def process_repos_concurrently(
                 repo_info = result[0]
                 save_data_batch([repo_info], os.path.join(DATA_DIR, "repos.parquet"))
                 mark_repo_as_processed_db(repo_key)
-
+            update_status()
             return True
         except Exception as e:
             logging.error(f"❌ Error procesando repo {repo_key}: {e}")
@@ -956,18 +957,14 @@ async def main():
 
     # Configurar sesión HTTP asíncrona con timeouts más generosos
     timeout = aiohttp.ClientTimeout(
-        total=30,  # tiempo máximo total para la request
-        connect=10,  # tiempo para establecer conexión
-        sock_connect=30,  # tiempo para conectar
-        sock_read=30,  # tiempo para leer la respuesta
+        total=60,  # request completa
+        connect=10,  # handshake TCP
+        sock_read=30,  # tiempo máximo entre chunks de datos
     )
     connector = aiohttp.TCPConnector(
-        limit=MAX_CONCURRENT_REQUESTS,
-        limit_per_host=SEMAPHORE_LIMIT,
+        limit=10,
         ttl_dns_cache=300,
         use_dns_cache=True,
-        keepalive_timeout=30,  # Timeout de keep-alive
-        enable_cleanup_closed=True,  # Limpiar conexiones cerradas
         ssl=False,  # Deshabilitar SSL para evitar problemas
     )
 
