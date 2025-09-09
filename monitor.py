@@ -110,7 +110,7 @@ def show_status():
         # Datos recolectados
         print("🗃️ DATOS RECOLECTADOS")
         print("-" * 40)
-        print(f"⭐ Stars:            {status.get('stars_fetched', 0):,}")
+        print(f"⭐ Stars:            {status.get('stargazers_fetched', 0):,}")
         print(f"👥 Contributors:     {status.get('contributors_fetched', 0):,}")
         print(f"🍴 Forks:            {status.get('forks_fetched', 0):,}")
         print(f"🐞 Issues:           {status.get('issues_fetched', 0):,}")
