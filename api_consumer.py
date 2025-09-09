@@ -1074,7 +1074,6 @@ async def main():
 
                     # Verificar si es tiempo de procesar usuarios
                     b = there_are_unprocessed_users()
-                    logging.warning(f"⏰ Verificando ciclo de usuarios... {b}")
                     if b:
                         await process_users_cycle_async(session)
 
