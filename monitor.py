@@ -93,12 +93,15 @@ def show_status():
         print("-" * 40)
         print(f"🏃 Runtime:           {status.get('runtime_formatted', 'N/A')}")
         print(f"📦 Repos procesados:  {status.get('repos_processed', 0):,}")
-        print(f"📄 Páginas:           {status.get('pages_processed', 0):,}")
+        print(f"📄 Páginas:           {status.get('pages_fetched', 0):,}")
         print(f"🌐 API calls:         {status.get('api_calls', 0):,}")
         print(f"❌ Errores:           {status.get('errors', 0):,}")
         print(f"⏸️ Rate limits:       {status.get('rate_limits', 0)}")
         print(f"📈 Repos/hora:        {status.get('avg_repos_per_hour', 0):.1f}")
         print(f"📈 Calls/minuto:      {status.get('avg_api_calls_per_minute', 0):.1f}")
+        print(
+            f"📈 paginas/minuto:   {status.get('avg_pages_fetched_per_minute', 0):.1f}"
+        )
         print(f"🎯 Último repo:       {status.get('last_repo', 'N/A')}")
         print(
             f"⏳ Último procesamiento: {status.get('last_user_processing', 0):.1f} segundos"

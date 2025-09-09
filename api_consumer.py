@@ -43,8 +43,11 @@ MAX_USERS_TO_PROCESS = 2  # Máximo usuarios a procesar por ciclo
 BACKUP_TIMEOUT = 3600  # 1 hora
 
 # CONFIGURACIÓN ASÍNCRONA
-MAX_CONCURRENT_REQUESTS = 2  # Reducido para evitar rate limiting
-SEMAPHORE_LIMIT = 2  # Reducido para mayor estabilidad
+MAX_CONCURRENT_REQUESTS = 2  # Máximo requests concurrentes
+SEMAPHORE_LIMIT = 2  # limite de conexiones simultaneas a la API
+REPOS_BATCH_SIZE = 4  # Número de repos a procesar en paralelo
+SEMAPHORE_REPO_LIMIT = 2  # Límite DE procesamiento de repositorios en simultáneo
+
 REQUEST_DELAY = 0.5  # Aumentado para evitar rate limiting
 
 # Configuración de logging
@@ -63,8 +66,14 @@ if os.path.exists(STATUS_FILE):
             stats = json.load(f)
             stats["start_time"] = time.time()
             stats["repos_processed"] = 0
-            stats["pages_processed"] = 0
+            stats["pages_processed"] = 0  # paginas de pantalla principal de github
+            stats["pages_fetched"] = 0  # paginas de pagination
             stats["api_calls"] = 0
+
+            if stats.get("all_repos_processed") is None:
+                stats["all_repos_processed"] = 0
+            if stats.get("repos_fetched") is None:
+                stats["repos_fetched"] = 0
             if stats.get("users_processed") is None:
                 stats["users_processed"] = 0
                 stats["last_user_processing"] = 0
@@ -85,6 +94,7 @@ if not stats:
         "last_repo": "",
         "errors": 0,
         "rate_limits": 0,
+        "pages_fetched": 0,
         "repos_fetched": 0,
         "all_repos_processed": 0,
         "stargazers_fetched": 0,
@@ -133,6 +143,9 @@ def update_status():
         "runtime_formatted": f"{runtime//3600:.0f}h {(runtime%3600)//60:.0f}m {runtime%60:.0f}s",
         "repos_processed": stats["repos_processed"],
         "pages_processed": stats["pages_processed"],
+        "pages_fetched": stats["pages_fetched"],
+        "repos_fetched": stats["repos_fetched"],
+        "all_repos_processed": stats["all_repos_processed"],
         "api_calls": stats["api_calls"],
         "last_repo": stats["last_repo"],
         "errors": stats["errors"],
@@ -142,6 +155,9 @@ def update_status():
         ),
         "avg_api_calls_per_minute": (
             stats["api_calls"] / (runtime / 60) if runtime > 0 else 0
+        ),
+        "avg_pages_fetched_per_minute": (
+            stats["pages_fetched"] / (runtime / 60) if runtime > 0 else 0
         ),
         "stargazers_fetched": stats["stargazers_fetched"],
         "contributors_fetched": stats["contributors_fetched"],
@@ -521,40 +537,37 @@ async def get_paginated_async(
                 async with request_semaphore:
                     async with session.get(current_url, params=page_params) as resp:
                         stats["api_calls"] += 1
-
-                        # Manejar rate limiting
                         rate_limited = await handle_rate_limit(resp.headers)
                         if rate_limited:
                             continue  # Salir del bucle de reintentos, continuar con siguiente página
-
                         batch = await resp.json()
 
-                        # Limitar items si se especifica max_items
-                        if max_items and items_fetched + len(batch) > max_items:
-                            batch = batch[: max_items - items_fetched]
+                # Limitar items si se especifica max_items
+                if max_items and items_fetched + len(batch) > max_items:
+                    batch = batch[: max_items - items_fetched]
 
-                        items_fetched += len(batch)
-                        yield batch
+                items_fetched += len(batch)
+                yield batch
 
-                        if not batch or (max_items and items_fetched >= max_items):
-                            return  # Terminar completamente
+                if not batch or (max_items and items_fetched >= max_items):
+                    return  # Terminar completamente
 
-                        # Usar Link header para siguiente página
-                        links = resp.headers.get("Link", "")
-                        current_url = None
-                        for part in links.split(","):
-                            if 'rel="next"' in part:
-                                current_url = part[part.find("<") + 1 : part.find(">")]
+                # Usar Link header para siguiente página
+                links = resp.headers.get("Link", "")
+                current_url = None
+                for part in links.split(","):
+                    if 'rel="next"' in part:
+                        current_url = part[part.find("<") + 1 : part.find(">")]
 
-                        page += 1
+                page += 1
+                stats["pages_fetched"] += 1
+                logging.info(f"➡️ Página {page} obtenida, total items: {items_fetched}")
 
-                        # Seguridad: evitar bucles infinitos
-                        if page > 5000:
-                            logging.warning(
-                                f"⚠️ Alcanzado límite de páginas, deteniendo..."
-                            )
-                            return
-                        break  # Éxito, salir del bucle de reintentos
+                # Seguridad: evitar bucles infinitos
+                if page > 5000:
+                    logging.warning(f"⚠️ Alcanzado límite de páginas, deteniendo...")
+                    return
+                break  # Éxito, salir del bucle de reintentos
 
             except Exception as e:
                 if attempt == MAX_RETRIES - 1:  # Último intento
@@ -904,7 +917,7 @@ async def process_repos_concurrently(
             return False
 
     # Procesar repos en lotes concurrentes
-    semaphore_repo = asyncio.Semaphore(SEMAPHORE_LIMIT)
+    semaphore_repo = asyncio.Semaphore(SEMAPHORE_REPO_LIMIT)
 
     async def bounded_process(name: str):
         async with semaphore_repo:
@@ -983,7 +996,7 @@ async def main():
 
                         # Procesar en lotes pequeños para no sobrecargar
                         batch_size = min(
-                            MAX_CONCURRENT_REQUESTS, len(unprocessed_repos)
+                            REPOS_BATCH_SIZE, len(unprocessed_repos)
                         )  # Lotes más pequeños
                         for i in range(0, len(unprocessed_repos), batch_size):
                             batch = unprocessed_repos[i : i + batch_size]
@@ -993,9 +1006,6 @@ async def main():
                             if time.time() - last_progress_log > 300:
                                 log_progress()
                                 last_progress_log = time.time()
-
-                            # Pausa más larga entre lotes para ser más respetuoso con la API
-                            await asyncio.sleep(5)
 
                         continue  # Volver al inicio del loop para verificar más repos pendientes
 
