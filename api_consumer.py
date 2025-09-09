@@ -236,6 +236,8 @@ def init_db():
     """
     )
 
+    ## delete users table
+    cur.execute("DROP TABLE IF EXISTS users")
     cur.execute(
         """
     CREATE TABLE IF NOT EXISTS users (
@@ -400,14 +402,14 @@ def update_user_name(id_user: int, user_name: str):
     conn.close()
 
 
-def update_users_from_stargazers_db():
-    """Añade nuevos usuarios desde la tabla de stargazers"""
+def update_users_from_contributors_db():
+    """Añade nuevos usuarios desde la tabla de contributors"""
     conn = get_db_conn()
     cur = conn.cursor()
     cur.execute(
         """
         INSERT OR IGNORE INTO users(id_user, user, processed, stars_count)
-        SELECT DISTINCT id_user, NULL, 0, 0 FROM stargazers
+        SELECT DISTINCT id_user, NULL, 0, 0 FROM contributors
         WHERE id_user NOT IN (SELECT id_user FROM users)
         """
     )
@@ -842,7 +844,7 @@ async def process_users_cycle_async(session: aiohttp.ClientSession):
 
     logging.info("🔄 Iniciando ciclo de procesamiento de usuarios (async)...")
     # Añadir nuevos usuarios desde stargazers no procesados
-    update_users_from_stargazers_db()
+    update_users_from_contributors_db()
     # Obtener usuarios únicos no procesados de la base de datos
     unprocessed_users = get_unprocessed_users_db(MAX_USERS_TO_PROCESS)
 
@@ -1037,6 +1039,7 @@ async def main():
 
     # Inicializar base de datos
     init_db()
+    update_users_from_contributors_db()
     load_stats_from_db()
     update_status()
     if not os.path.exists(DATA_DIR):
