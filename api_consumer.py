@@ -62,6 +62,9 @@ if os.path.exists(STATUS_FILE):
         try:
             stats = json.load(f)
             stats["start_time"] = time.time()
+            stats["repos_processed"] = 0
+            stats["pages_processed"] = 0
+            stats["api_calls"] = 0
             if stats.get("users_processed") is None:
                 stats["users_processed"] = 0
                 stats["last_user_processing"] = 0
@@ -382,6 +385,64 @@ async def handle_rate_limit(response_headers: dict) -> bool:
             return True  # Indica que se durmió
 
     return False  # No se durmió
+
+
+def load_stats_from_db():
+    """Carga estadísticas desde la base de datos al iniciar"""
+    global stats
+    conn = get_db_conn()
+    cur = conn.cursor()
+
+    # Cargar conteos
+    cur.execute("SELECT COUNT(*) FROM repos WHERE processed=1")
+    stats["repos_processed"] = cur.fetchone()[0]
+
+    cur.execute("SELECT COUNT(*) FROM users WHERE processed=1")
+    stats["users_processed"] = cur.fetchone()[0]
+
+    conn.close()
+    logging.info(
+        f"Estadísticas cargadas desde DB: {stats['repos_processed']} repos, {stats['users_processed']} usuarios procesados"
+    )
+
+
+def load_stats_from_parquet():
+    """Carga estadísticas desde archivos parquet al iniciar"""
+    global stats
+
+    # Cargar repos procesados
+    stargazers_path = os.path.join(DATA_DIR, "stargazers.parquet")
+    if os.path.exists(stargazers_path):
+        try:
+            df = pd.read_parquet(stargazers_path, engine=PARQUET_ENGINE)
+            stats["stargazers_fetched"] = len(df)
+        except Exception as e:
+            logging.error(f"Error cargando stargazers.parquet: {e}")
+    contributors_path = os.path.join(DATA_DIR, "contributors.parquet")
+    if os.path.exists(contributors_path):
+        try:
+            df = pd.read_parquet(contributors_path, engine=PARQUET_ENGINE)
+            stats["contributors_fetched"] = len(df)
+        except Exception as e:
+            logging.error(f"Error cargando contributors.parquet: {e}")
+    forks_path = os.path.join(DATA_DIR, "forks.parquet")
+    if os.path.exists(forks_path):
+        try:
+            df = pd.read_parquet(forks_path, engine=PARQUET_ENGINE)
+            stats["forks_fetched"] = len(df)
+        except Exception as e:
+            logging.error(f"Error cargando forks.parquet: {e}")
+    issues_path = os.path.join(DATA_DIR, "issues.parquet")
+    if os.path.exists(issues_path):
+        try:
+            df = pd.read_parquet(issues_path, engine=PARQUET_ENGINE)
+            stats["issues_fetched"] = len(df)
+        except Exception as e:
+            logging.error(f"Error cargando issues.parquet: {e}")
+    gc.collect()
+    logging.info(
+        f"Estadísticas cargadas desde parquet: {stats['stargazers_fetched']} stargazers, {stats['contributors_fetched']} contributors, {stats['forks_fetched']} forks, {stats['issues_fetched']} issues"
+    )
 
 
 async def github_request_async(
@@ -869,6 +930,8 @@ async def main():
 
     # Inicializar base de datos
     init_db()
+    load_stats_from_db()
+    load_stats_from_parquet()
 
     if not os.path.exists(DATA_DIR):
         os.makedirs(DATA_DIR)
