@@ -6,36 +6,44 @@ import json
 import logging
 from dotenv import load_dotenv
 import pandas as pd
-import fastparquet
 from datetime import datetime
 import signal
 import sys
 import gc  # Garbage collector
 import shutil
 from typing import List, Dict, Optional, Tuple, AsyncGenerator
+import sqlite3
 
 load_dotenv()
 
 DEBUG = os.getenv("DEBUG", "False").lower() in ("true", "1", "t")
 START_DATE = os.getenv("START_DATE", "2025-01-01")
-PARQUET_ENGINE = "fastparquet"
+
+# Intentar importar fastparquet, usar pyarrow como fallback
+try:
+    import fastparquet
+
+    PARQUET_ENGINE = "fastparquet"
+except ImportError:
+    PARQUET_ENGINE = "pyarrow"
+    logging.warning("fastparquet no disponible, usando pyarrow")
 
 # Configuración para prevenir memory leaks
 MAX_ITEMS_PER_ENDPOINT = 3000  # Límite máximo por endpoint
 BATCH_SIZE = 100  # Procesar en lotes
 FORCE_GC_EVERY = 3  # Forzar garbage collection cada N repos
 
-# NUEVA CONFIGURACIÓN: Tiempo para procesar usuarios (en segundos)
+# Tiempo para procesar usuarios (en segundos)
 USER_PROCESSING_INTERVAL = 360
-MAX_USERS_TO_PROCESS = 10  # Máximo usuarios a procesar por ciclo
+MAX_USERS_TO_PROCESS = 1  # Máximo usuarios a procesar por ciclo
 
-# NUEVA CONFIGURACIÓN: Tiempo de espera para copias de seguridad (en segundos)
+# Tiempo de espera para copias de seguridad (en segundos)
 BACKUP_TIMEOUT = 3600  # 1 hora
 
 # CONFIGURACIÓN ASÍNCRONA
-MAX_CONCURRENT_REQUESTS = 10  # Máximo requests concurrentes
-SEMAPHORE_LIMIT = 5  # Límite del semáforo para controlar concurrencia
-REQUEST_DELAY = 0.1  # Delay entre requests para evitar rate limiting
+MAX_CONCURRENT_REQUESTS = 5  # Reducido para evitar rate limiting
+SEMAPHORE_LIMIT = 5  # Reducido para mayor estabilidad
+REQUEST_DELAY = 0.5  # Aumentado para evitar rate limiting
 
 # Configuración de logging
 DATA_DIR = "data"
@@ -43,6 +51,7 @@ if not os.path.exists(DATA_DIR):
     os.makedirs(DATA_DIR)
 LOG_PATH = os.path.join(DATA_DIR, "api_consumer.log")
 STATUS_FILE = os.path.join(DATA_DIR, "status.json")
+DB_PATH = os.path.join(DATA_DIR, "state.db")
 
 # Variables globales para estadísticas
 stats = None
@@ -71,7 +80,7 @@ if not stats:
         "last_repo": "",
         "errors": 0,
         "rate_limits": 0,
-        "stars_fetched": 0,
+        "stargazers_fetched": 0,
         "contributors_fetched": 0,
         "forks_fetched": 0,
         "issues_fetched": 0,
@@ -88,12 +97,12 @@ logging.basicConfig(
 )
 
 if DEBUG:
-    logging.getLogger().setLevel(logging.INFO)
+    logging.getLogger().setLevel(logging.DEBUG)
     logging.info("Modo DEBUG activado")
 
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN2")
 if not GITHUB_TOKEN:
-    raise ValueError("❌ No se encontró GITHUB_TOKEN en el .env")
+    raise ValueError("❌ No se encontró GITHUB_TOKEN2 en el .env")
 
 HEADERS = {
     "Authorization": f"Bearer {GITHUB_TOKEN}",
@@ -127,7 +136,7 @@ def update_status():
         "avg_api_calls_per_minute": (
             stats["api_calls"] / (runtime / 60) if runtime > 0 else 0
         ),
-        "stars_fetched": stats["stars_fetched"],
+        "stargazers_fetched": stats["stargazers_fetched"],
         "contributors_fetched": stats["contributors_fetched"],
         "forks_fetched": stats["forks_fetched"],
         "issues_fetched": stats["issues_fetched"],
@@ -178,13 +187,208 @@ def backup_data_folder():
         logging.error(f"❌ Error al crear copia de seguridad: {e}")
 
 
+def get_db_conn():
+    """Obtiene conexión a la base de datos SQLite"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    return conn
+
+
+def init_db():
+    """Inicializa la base de datos SQLite"""
+    db_exists = os.path.exists(DB_PATH)
+
+    conn = get_db_conn()
+    cur = conn.cursor()
+
+    # Crear tablas si no existen
+    cur.execute(
+        """
+    CREATE TABLE IF NOT EXISTS repos (
+        repo TEXT PRIMARY KEY,
+        owner TEXT,
+        processed INTEGER DEFAULT 0,
+        created_at TEXT,
+        updated_at TEXT
+    )
+    """
+    )
+
+    cur.execute(
+        """
+    CREATE TABLE IF NOT EXISTS users (
+        user TEXT PRIMARY KEY,
+        processed INTEGER DEFAULT 0,
+        stars_count INTEGER DEFAULT 0
+    )
+    """
+    )
+
+    conn.commit()
+
+    # Si la DB es nueva y existen los parquet → migrar datos
+    if not db_exists:
+        logging.info("Migrando datos de parquet a SQLite...")
+
+        # Migrar users.parquet
+        users_path = os.path.join(DATA_DIR, "users.parquet")
+        if os.path.exists(users_path):
+            try:
+                users_df = pd.read_parquet(users_path, engine=PARQUET_ENGINE)
+                if not users_df.empty:
+                    cur.executemany(
+                        "INSERT OR IGNORE INTO users(user, processed, stars_count) VALUES (?, ?, ?)",
+                        users_df[["user", "processed", "stars_count"]].itertuples(
+                            index=False, name=None
+                        ),
+                    )
+                    logging.info(f"→ Migrados {len(users_df)} usuarios")
+            except Exception as e:
+                logging.error(f"Error migrando usuarios: {e}")
+
+        # Migrar repos.parquet
+        repos_path = os.path.join(DATA_DIR, "repos.parquet")
+        if os.path.exists(repos_path):
+            try:
+                repos_df = pd.read_parquet(repos_path, engine=PARQUET_ENGINE)
+                if not repos_df.empty:
+                    cur.executemany(
+                        """INSERT OR IGNORE INTO repos(repo, owner, processed, created_at, updated_at)
+                           VALUES (?, ?, ?, ?, ?)""",
+                        repos_df[
+                            ["repo", "owner", "processed", "created_at", "updated_at"]
+                        ].itertuples(index=False, name=None),
+                    )
+                    logging.info(f"→ Migrados {len(repos_df)} repositorios")
+            except Exception as e:
+                logging.error(f"Error migrando repos: {e}")
+
+        conn.commit()
+
+    conn.close()
+
+
+def add_new_users(users: List[str]):
+    """Añade nuevos usuarios a la base de datos"""
+    if not users:
+        return
+
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.executemany(
+        "INSERT OR IGNORE INTO users(user, processed, stars_count) VALUES (?, 0, 0)",
+        [(u,) for u in users],
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_unprocessed_users_db(limit=MAX_USERS_TO_PROCESS):
+    """Obtiene usuarios no procesados de la base de datos"""
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT user FROM users WHERE processed=0 LIMIT ?", (limit,))
+    users = [r[0] for r in cur.fetchall()]
+    conn.close()
+    return users
+
+
+def add_new_repos(repos: List[dict]):
+    """Añade nuevos repositorios a la base de datos"""
+    if not repos:
+        return
+
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.executemany(
+        """INSERT OR IGNORE INTO repos(repo, owner, processed, created_at, updated_at)
+           VALUES (?, ?, 0, ?, ?)""",
+        [(r["repo"], r["owner"], r["created_at"], r["updated_at"]) for r in repos],
+    )
+    conn.commit()
+    conn.close()
+
+
+def mark_repo_as_processed_db(repo_key: str):
+    """Marca un repositorio como procesado en la base de datos"""
+    conn = get_db_conn()
+    conn.execute("UPDATE repos SET processed=1 WHERE repo=?", (repo_key,))
+    conn.commit()
+    conn.close()
+
+
+def get_unprocessed_repos_db(limit=100):
+    """Obtiene repositorios no procesados de la base de datos"""
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT repo FROM repos WHERE processed=0 LIMIT ?", (limit,))
+    repos = cur.fetchall()
+    conn.close()
+    repos = [r[0] for r in repos]
+    return repos
+
+
+def add_user_stars_count(user: str, stars_count: int):
+    """Actualiza el conteo de estrellas de un usuario"""
+    conn = get_db_conn()
+    conn.execute("UPDATE users SET stars_count=? WHERE user=?", (stars_count, user))
+    conn.commit()
+    conn.close()
+
+
+def update_processed_users(users: List[str]):
+    """Marca usuarios como procesados"""
+    if not users:
+        return
+
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.executemany(
+        "UPDATE users SET processed=1 WHERE user=?",
+        [(u,) for u in users],
+    )
+    conn.commit()
+    conn.close()
+
+
+def is_repo_processed(repo_key: str) -> bool:
+    """Verifica si un repositorio ya ha sido procesado"""
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT processed FROM repos WHERE repo=?", (repo_key,))
+    row = cur.fetchone()
+    conn.close()
+    return row is not None and row[0] == 1
+
+
+async def handle_rate_limit(response_headers: dict) -> bool:
+    """Maneja el rate limiting de forma centralizada"""
+    remaining = response_headers.get("X-RateLimit-Remaining")
+    reset = response_headers.get("X-RateLimit-Reset")
+
+    if remaining:
+        stats["rate_limits"] = int(remaining)
+
+        if int(remaining) <= 10:
+            reset_time = int(reset) if reset else time.time() + 60
+            sleep_time = max(reset_time - int(time.time()), 60)
+            logging.warning(
+                f"💤 Rate limit bajo ({remaining}). Durmiendo {sleep_time}s..."
+            )
+            update_status()
+            await asyncio.sleep(sleep_time)
+            return True  # Indica que se durmió
+
+    return False  # No se durmió
+
+
 async def github_request_async(
     session: aiohttp.ClientSession,
     url: str,
     params: Optional[Dict] = None,
     retries: int = 3,
 ) -> Optional[Dict]:
-    """Versión asíncrona de github_request con manejo de rate limiting"""
+    """Versión asíncrona de github_request con manejo mejorado de rate limiting"""
     global stats
 
     async with request_semaphore:
@@ -192,53 +396,35 @@ async def github_request_async(
 
         for attempt in range(retries):
             try:
-                await asyncio.sleep(
-                    REQUEST_DELAY
-                )  # Pequeño delay para evitar rate limiting
+                await asyncio.sleep(REQUEST_DELAY)  # Delay para evitar rate limiting
 
                 async with session.get(url, params=params) as resp:
-                    # Obtener headers de rate limiting
-                    remaining = resp.headers.get("X-RateLimit-Remaining")
-                    reset = resp.headers.get("X-RateLimit-Reset")
-
-                    if remaining:
-                        stats["rate_limits"] = int(remaining)
-
-                        # Si quedan pocos requests, esperar
-                        if int(remaining) <= 10:
-                            reset_time = int(reset) if reset else time.time() + 60
-                            sleep_time = max(reset_time - int(time.time()), 60)
-                            logging.warning(
-                                f"💤 Rate limit bajo ({remaining}). Durmiendo {sleep_time}s..."
-                            )
-                            update_status()
-                            await asyncio.sleep(sleep_time)
-                            continue
+                    # Manejar rate limiting
+                    rate_limited = await handle_rate_limit(resp.headers)
+                    if rate_limited:
+                        continue  # Reintentar después del sleep
 
                     if resp.status == 200:
                         return await resp.json()
-                    elif (
-                        resp.status == 403
-                        and "rate limit" in (await resp.text()).lower()
-                    ):
-                        # Rate limit específico
-                        reset_time = int(reset) if reset else time.time() + 60
-                        sleep_time = max(reset_time - int(time.time()), 60)
-                        logging.warning(
-                            f"💤 Rate limit alcanzado. Durmiendo {sleep_time}s..."
-                        )
-                        await asyncio.sleep(sleep_time)
-                        continue
+                    elif resp.status == 403:
+                        error_text = await resp.text()
+                        if "rate limit" in error_text.lower():
+                            # Rate limit específico del response body
+                            await asyncio.sleep(60)
+                            continue
                     else:
                         stats["errors"] += 1
                         logging.error(f"❌ Error en API: {resp.status} - {url}")
 
+            except asyncio.TimeoutError:
+                logging.error(f"⏱️ Timeout en request: {url}")
+                stats["errors"] += 1
             except Exception as e:
                 logging.error(f"❌ Error en request: {e}")
                 stats["errors"] += 1
 
-            # Esperar antes del siguiente intento
-            await asyncio.sleep(2**attempt)
+            # Esperar antes del siguiente intento (backoff exponencial)
+            await asyncio.sleep(min(2**attempt, 60))
 
         return None
 
@@ -249,42 +435,30 @@ async def get_paginated_async(
     params: Optional[Dict] = None,
     max_items: Optional[int] = None,
 ) -> AsyncGenerator[List[Dict], None]:
-    """Generador asíncrono para paginación"""
+    """Generador asíncrono para paginación mejorado"""
     page = 1
     items_fetched = 0
 
-    while url and (max_items is None or items_fetched < max_items):
-        if not params:
-            params = {}
-        params["per_page"] = 100
+    if not params:
+        params = {}
 
-        logging.info(f"[get_paginated_async] Página {page} - URL: {url}")
+    current_url = url
 
-        # Hacer request asíncrono
-        async with session.get(url, params=params) as resp:
+    while current_url and (max_items is None or items_fetched < max_items):
+        page_params = params.copy()
+        page_params["per_page"] = min(
+            100, max_items - items_fetched if max_items else 100
+        )
+
+        logging.info(f"[Paginación] Página {page} - URL: {current_url}")
+
+        async with session.get(current_url, params=page_params) as resp:
             stats["api_calls"] += 1
 
-            # Control de rate limiting
-            remaining = resp.headers.get("X-RateLimit-Remaining")
-            reset = resp.headers.get("X-RateLimit-Reset")
-
-            if remaining:
-                stats["rate_limits"] = int(remaining)
-
-                if int(remaining) <= 10:
-                    reset_time = int(reset) if reset else time.time() + 60
-                    sleep_time = max(reset_time - int(time.time()), 60)
-                    logging.warning(
-                        f"💤 Rate limit en paginación. Durmiendo {sleep_time}s..."
-                    )
-                    update_status()
-                    await asyncio.sleep(sleep_time)
-                    continue
-
-            if resp.status != 200:
-                logging.error(f"❌ Error en paginación: status {resp.status}")
-                stats["errors"] += 1
-                break
+            # Manejar rate limiting
+            rate_limited = await handle_rate_limit(resp.headers)
+            if rate_limited:
+                continue  # Reintentar la misma página
 
             batch = await resp.json()
 
@@ -300,46 +474,55 @@ async def get_paginated_async(
 
             # Usar Link header para siguiente página
             links = resp.headers.get("Link", "")
-            next_url = None
+            current_url = None
             for part in links.split(","):
                 if 'rel="next"' in part:
-                    next_url = part[part.find("<") + 1 : part.find(">")]
+                    current_url = part[part.find("<") + 1 : part.find(">")]
 
-            url = next_url
             page += 1
 
             # Seguridad: evitar bucles infinitos
             if page > 5000:
-                logging.warning(
-                    f"⚠️ Alcanzado límite de seguridad de páginas, deteniendo..."
-                )
+                logging.warning(f"⚠️ Alcanzado límite de páginas, deteniendo...")
                 break
 
 
-def save_data_batch(data_list, file_path, columns=None):
+def save_data_batch(data_list: List[Dict], file_path: str, columns=None):
     """
-    Guarda datos en lotes para evitar problemas de memoria con append
+    Guarda datos en lotes de forma más eficiente en memoria
     """
     if not data_list:
         return
 
-    df = pd.DataFrame(data_list)
+    try:
+        df = pd.DataFrame(data_list)
 
-    if os.path.exists(file_path):
-        # Leer archivo existente y concatenar
-        existing_df = pd.read_parquet(file_path, engine=PARQUET_ENGINE)
-        combined_df = pd.concat([existing_df, df], ignore_index=True)
-    else:
-        combined_df = df
+        if os.path.exists(file_path):
+            # Usar modo append si el engine lo soporta
+            if PARQUET_ENGINE == "fastparquet":
+                # fastparquet soporta append
+                df.to_parquet(
+                    file_path, index=False, engine=PARQUET_ENGINE, append=True
+                )
+            else:
+                # pyarrow: leer, concatenar y escribir
+                existing_df = pd.read_parquet(file_path, engine=PARQUET_ENGINE)
+                combined_df = pd.concat([existing_df, df], ignore_index=True)
+                combined_df.to_parquet(file_path, index=False, engine=PARQUET_ENGINE)
+                del existing_df, combined_df
+        else:
+            df.to_parquet(file_path, index=False, engine=PARQUET_ENGINE)
 
-    # Escribir de vuelta
-    combined_df.to_parquet(file_path, index=False, engine=PARQUET_ENGINE)
+        # Si es stargazers, añadir usuarios únicos
+        if file_path.endswith("stargazers.parquet") and "user" in df.columns:
+            unique_users = df["user"].unique().tolist()
+            add_new_users(unique_users)
 
-    # Limpiar memoria
-    del df, combined_df
-    if "existing_df" in locals():
-        del existing_df
-    gc.collect()
+        del df
+        gc.collect()
+
+    except Exception as e:
+        logging.error(f"❌ Error guardando datos en {file_path}: {e}")
 
 
 async def get_repos_by_topic_async(
@@ -358,7 +541,7 @@ async def get_repos_by_topic_async(
     data = await github_request_async(session, url, params)
     if not data:
         return []
-    return data["items"]
+    return data.get("items", [])
 
 
 async def fetch_repo_endpoint(
@@ -373,42 +556,46 @@ async def fetch_repo_endpoint(
 
     async for batch in get_paginated_async(session, endpoint_url, max_items=max_items):
         for item in batch:
-            if endpoint_name == "stargazers":
-                data.append(
-                    {
-                        "repo": repo_key,
-                        "user": item["user"]["login"],
-                        "timestamp": item["starred_at"],
-                    }
-                )
-            elif endpoint_name == "contributors":
-                data.append(
-                    {
-                        "repo": repo_key,
-                        "user": item["login"],
-                        "commits": item["contributions"],
-                    }
-                )
-            elif endpoint_name == "forks":
-                data.append(
-                    {
-                        "repo": repo_key,
-                        "user": item["owner"]["login"],
-                        "timestamp": item["created_at"],
-                        "name": item["full_name"],
-                        "url": item["html_url"],
-                    }
-                )
-            elif endpoint_name == "issues":
-                if "pull_request" not in item:  # Filtrar PRs
+            try:
+                if endpoint_name == "stargazers":
                     data.append(
                         {
                             "repo": repo_key,
                             "user": item["user"]["login"],
-                            "timestamp": item["created_at"],
-                            "url": item["html_url"],
+                            "timestamp": item.get("starred_at", ""),
                         }
                     )
+                elif endpoint_name == "contributors":
+                    data.append(
+                        {
+                            "repo": repo_key,
+                            "user": item["login"],
+                            "commits": item.get("contributions", 0),
+                        }
+                    )
+                elif endpoint_name == "forks":
+                    data.append(
+                        {
+                            "repo": repo_key,
+                            "user": item["owner"]["login"],
+                            "timestamp": item.get("created_at", ""),
+                            "name": item.get("full_name", ""),
+                            "url": item.get("html_url", ""),
+                        }
+                    )
+                elif endpoint_name == "issues":
+                    if "pull_request" not in item:  # Filtrar PRs
+                        data.append(
+                            {
+                                "repo": repo_key,
+                                "user": item["user"]["login"],
+                                "timestamp": item.get("created_at", ""),
+                                "url": item.get("html_url", ""),
+                            }
+                        )
+            except KeyError as e:
+                logging.error(f"❌ Error procesando item en {endpoint_name}: {e}")
+                continue
 
         # Procesar en lotes para evitar acumulación en memoria
         if len(data) >= BATCH_SIZE:
@@ -421,7 +608,7 @@ async def fetch_repo_endpoint(
         save_data_batch(data, os.path.join(DATA_DIR, f"{endpoint_name}.parquet"))
         stats[f"{endpoint_name}_fetched"] += len(data)
 
-    return data
+    return []  # Retornamos lista vacía ya que guardamos directamente
 
 
 async def get_repo_data_async(
@@ -460,24 +647,32 @@ async def get_repo_data_async(
 
     # Crear tareas concurrentes para todos los endpoints
     endpoints = [
-        (f"{BASE_URL}/repos/{owner}/{repo}/stargazers", "stargazers"),
-        (f"{BASE_URL}/repos/{owner}/{repo}/contributors", "contributors"),
-        (f"{BASE_URL}/repos/{owner}/{repo}/forks", "forks"),
-        (f"{BASE_URL}/repos/{owner}/{repo}/issues", "issues"),
+        (f"{BASE_URL}/repos/{repo_key}/stargazers", "stargazers"),
+        (f"{BASE_URL}/repos/{repo_key}/contributors", "contributors"),
+        (f"{BASE_URL}/repos/{repo_key}/forks", "forks"),
+        (f"{BASE_URL}/repos/{repo_key}/issues", "issues"),
     ]
 
     # Ejecutar todas las tareas concurrentemente
     logging.info(
         f"🚀 Procesando {len(endpoints)} endpoints concurrentemente para {repo_key}..."
     )
-    tasks = []
 
-    for endpoint_url, endpoint_name in endpoints:
-        task = fetch_repo_endpoint(session, endpoint_url, repo_key, endpoint_name)
-        tasks.append(task)
+    tasks = [
+        fetch_repo_endpoint(session, endpoint_url, repo_key, endpoint_name)
+        for endpoint_url, endpoint_name in endpoints
+    ]
 
     # Esperar a que todas las tareas se completen
-    await asyncio.gather(*tasks, return_exceptions=True)
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Manejar excepciones
+    for i, result in enumerate(results):
+        if isinstance(result, Exception):
+            endpoint_name = endpoints[i][1]
+            logging.error(
+                f"❌ Error en endpoint {endpoint_name} para {repo_key}: {result}"
+            )
 
     stats["repos_processed"] += 1
     logging.info(
@@ -500,61 +695,14 @@ async def process_users_cycle_async(session: aiohttp.ClientSession):
 
     logging.info("🔄 Iniciando ciclo de procesamiento de usuarios (async)...")
 
-    stars_path = os.path.join(DATA_DIR, "stargazers.parquet")
-    users_path = os.path.join(DATA_DIR, "users.parquet")
-    repos_path = os.path.join(DATA_DIR, "repos.parquet")
+    # Obtener usuarios únicos no procesados de la base de datos
+    unprocessed_users = get_unprocessed_users_db(MAX_USERS_TO_PROCESS)
 
-    # 1. Obtener usuarios únicos de stargazers.parquet
-    if not os.path.exists(stars_path):
-        logging.info(
-            "⚠️ No existe stargazers.parquet, saltando procesamiento de usuarios"
-        )
+    if not unprocessed_users:
+        logging.info("ℹ️ No hay usuarios pendientes para procesar")
         return
 
-    # Usar duckdb para obtener usuarios únicos sin cargar todo el parquet en memoria
-    stars_df = pd.read_parquet(stars_path, engine=PARQUET_ENGINE)
-    unique_users = set(stars_df["user"].unique())
-    del stars_df
-    gc.collect()
-    logging.info(f"👤 Encontrados {len(unique_users)} usuarios únicos en stars")
-
-    # 2. Crear/actualizar users.parquet
-    existing_users = set()
-    if os.path.exists(users_path):
-        users_df = pd.read_parquet(users_path, engine=PARQUET_ENGINE)
-        existing_users = set(users_df["user"])
-        logging.info(f"👥 Ya existen {len(existing_users)} usuarios procesados")
-    else:
-        users_df = pd.DataFrame(columns=["user", "processed", "stars_count"])
-
-    # Agregar nuevos usuarios
-    new_users = []
-    for user in unique_users:
-        if user not in existing_users:
-            new_users.append({"user": user, "processed": False, "stars_count": 0})
-
-    if new_users:
-        new_users_df = pd.DataFrame(new_users)
-        if len(existing_users) > 0:
-            users_df = pd.concat([users_df, new_users_df], ignore_index=True)
-        else:
-            users_df = new_users_df
-        users_df.to_parquet(users_path, index=False, engine=PARQUET_ENGINE)
-        logging.info(f"➕ Agregados {len(new_users)} usuarios nuevos")
-
-    # 3. Procesar usuarios no procesados (limitado) - CONCURRENTEMENTE
-    unprocessed_users = (
-        users_df[users_df["processed"] == False]["user"]
-        .head(MAX_USERS_TO_PROCESS)
-        .tolist()
-    )
-    logging.info(f"🔍 Procesando {len(unprocessed_users)} usuarios concurrentemente...")
-
-    # Cargar repos existentes
-    existing_repos = set()
-    if os.path.exists(repos_path):
-        repos_df = pd.read_parquet(repos_path, engine=PARQUET_ENGINE)
-        existing_repos = set(repos_df["repo"])
+    logging.info(f"👤 Procesando {len(unprocessed_users)} usuarios...")
 
     # Procesar usuarios concurrentemente
     async def process_single_user(user: str) -> Tuple[str, List[Dict], int]:
@@ -564,42 +712,52 @@ async def process_users_cycle_async(session: aiohttp.ClientSession):
         new_repos = []
         user_starred_count = 0
 
-        # Obtener repositorios estrellados por el usuario usando paginación asíncrona
-        async for batch in get_paginated_async(
-            session, f"{BASE_URL}/users/{user}/starred"
-        ):
-            if not batch:
-                continue
-            for starred_data in batch:
-                repo_data = starred_data["repo"]
-                repo_key = repo_data["full_name"]
-                user_starred_count += 1
+        try:
+            # Obtener repositorios estrellados por el usuario usando paginación asíncrona
+            async for batch in get_paginated_async(
+                session, f"{BASE_URL}/users/{user}/starred"
+            ):
+                if not batch:
+                    continue
 
-                if repo_key not in existing_repos:
+                for item in batch:
+                    user_starred_count += 1
+                    starred_repo = item["repo"]
+                    repo_key = starred_repo["full_name"]
+
                     new_repo_info = {
                         "repo": repo_key,
-                        "owner": repo_data["owner"]["login"],
-                        "is_fork": repo_data.get("fork", False),
-                        "stars": repo_data.get("stargazers_count", 0),
-                        "forks": repo_data.get("forks_count", 0),
-                        "watchers": repo_data.get("watchers_count", 0),
-                        "open_issues": repo_data.get("open_issues_count", 0),
-                        "has_issues": repo_data.get("has_issues", False),
-                        "has_projects": repo_data.get("has_projects", False),
-                        "has_wiki": repo_data.get("has_wiki", False),
-                        "has_pages": repo_data.get("has_pages", False),
-                        "has_downloads": repo_data.get("has_downloads", False),
-                        "created_at": repo_data.get("created_at", ""),
-                        "updated_at": repo_data.get("updated_at", ""),
-                        "topics": ",".join(repo_data.get("topics", [])),
+                        "owner": starred_repo["owner"]["login"],
+                        "is_fork": starred_repo.get("fork", False),
+                        "stars": starred_repo.get("stargazers_count", 0),
+                        "forks": starred_repo.get("forks_count", 0),
+                        "watchers": starred_repo.get("watchers_count", 0),
+                        "open_issues": starred_repo.get("open_issues_count", 0),
+                        "has_issues": starred_repo.get("has_issues", False),
+                        "has_projects": starred_repo.get("has_projects", False),
+                        "has_wiki": starred_repo.get("has_wiki", False),
+                        "has_pages": starred_repo.get("has_pages", False),
+                        "has_downloads": starred_repo.get("has_downloads", False),
+                        "created_at": starred_repo.get("created_at", ""),
+                        "updated_at": starred_repo.get("updated_at", ""),
+                        "topics": ",".join(starred_repo.get("topics", [])),
                         "processed": False,
                     }
                     new_repos.append(new_repo_info)
 
+        except Exception as e:
+            logging.error(f"❌ Error procesando usuario {user}: {e}")
+
         return user, new_repos, user_starred_count
 
-    # Ejecutar procesamiento de usuarios concurrentemente
-    user_tasks = [process_single_user(user) for user in unprocessed_users]
+    # Ejecutar procesamiento de usuarios con límite de concurrencia
+    semaphore = asyncio.Semaphore(3)  # Límite más conservador para usuarios
+
+    async def bounded_process_user(user: str):
+        async with semaphore:
+            return await process_single_user(user)
+
+    user_tasks = [bounded_process_user(user) for user in unprocessed_users]
     user_results = await asyncio.gather(*user_tasks, return_exceptions=True)
 
     # Procesar resultados
@@ -616,20 +774,19 @@ async def process_users_cycle_async(session: aiohttp.ClientSession):
         processed_users.append(user)
 
         # Actualizar stars_count para el usuario
-        users_df.loc[users_df["user"] == user, "stars_count"] = stars_count
+        add_user_stars_count(user, stars_count)
         stats["users_processed"] += 1
 
-    # Guardar nuevos repos
+    # Guardar nuevos repos en la base de datos
     if all_new_repos:
-        save_data_batch(all_new_repos, repos_path)
+        add_new_repos(all_new_repos)
         logging.info(
             f"🆕 Agregados {len(all_new_repos)} nuevos repositorios para procesar"
         )
 
     # Marcar usuarios como procesados
     if processed_users:
-        users_df.loc[users_df["user"].isin(processed_users), "processed"] = True
-        users_df.to_parquet(users_path, index=False, engine=PARQUET_ENGINE)
+        update_processed_users(processed_users)
         logging.info(f"✅ Marcados {len(processed_users)} usuarios como procesados")
 
     stats["last_user_processing"] = time.time()
@@ -641,55 +798,26 @@ def should_process_users():
     return (time.time() - stats["last_user_processing"]) >= USER_PROCESSING_INTERVAL
 
 
-def get_unprocessed_repos():
-    """Obtiene repositorios no procesados"""
-    repos_path = os.path.join(DATA_DIR, "repos.parquet")
-    if not os.path.exists(repos_path):
-        return []
-
-    repos_df = pd.read_parquet(repos_path, engine=PARQUET_ENGINE)
-
-    # Si no existe la columna processed, agregarla con True para repos existentes
-    if "processed" not in repos_df.columns:
-        repos_df["processed"] = True
-        repos_df.to_parquet(repos_path, index=False, engine=PARQUET_ENGINE)
-        return []
-
-    unprocessed = repos_df[repos_df["processed"] == False]
-    return [
-        (row["owner"], row["repo"].split("/")[-1]) for _, row in unprocessed.iterrows()
-    ]
-
-
-def mark_repo_as_processed(repo_key):
-    """Marca un repositorio como procesado"""
-    repos_path = os.path.join(DATA_DIR, "repos.parquet")
-    if not os.path.exists(repos_path):
-        return
-
-    repos_df = pd.read_parquet(repos_path, engine=PARQUET_ENGINE)
-    repos_df.loc[repos_df["repo"] == repo_key, "processed"] = True
-    repos_df.to_parquet(repos_path, index=False, engine=PARQUET_ENGINE)
-    del repos_df
-    gc.collect()
-
-
 async def process_repos_concurrently(
     session: aiohttp.ClientSession,
-    repos_to_process: List[Tuple[str, str]],
-    existing_set: set,
+    repos_to_process: List[str],
 ):
     """Procesa múltiples repositorios concurrentemente"""
 
-    async def process_single_repo(owner: str, name: str):
-        repo_key = f"{owner}/{name}"
+    async def process_single_repo(repo_key: str):
+        repo_parts = repo_key.split("/")
+        owner = repo_parts[0]
+        name = repo_parts[1]
+        if is_repo_processed(repo_key):
+            logging.info(f"ℹ️ {repo_key} ya procesado, saltando...")
+            return True
         try:
             result = await get_repo_data_async(session, owner, name)
             if result[0] is not None:
                 repo_info = result[0]
                 save_data_batch([repo_info], os.path.join(DATA_DIR, "repos.parquet"))
-                mark_repo_as_processed(repo_key)
-                existing_set.add(repo_key)
+                mark_repo_as_processed_db(repo_key)
+
             return True
         except Exception as e:
             logging.error(f"❌ Error procesando repo {repo_key}: {e}")
@@ -698,11 +826,11 @@ async def process_repos_concurrently(
     # Procesar repos en lotes concurrentes
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
-    async def bounded_process(owner: str, name: str):
+    async def bounded_process(name: str):
         async with semaphore:
-            return await process_single_repo(owner, name)
+            return await process_single_repo(name)
 
-    tasks = [bounded_process(owner, name) for owner, name in repos_to_process]
+    tasks = [bounded_process(name) for name in repos_to_process]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     successful = sum(1 for r in results if r is True)
@@ -723,35 +851,21 @@ async def main():
     )
     logging.info(f"🚀 Máximo requests concurrentes: {MAX_CONCURRENT_REQUESTS}")
 
+    # Inicializar base de datos
+    init_db()
+
     if not os.path.exists(DATA_DIR):
         os.makedirs(DATA_DIR)
 
-    repos_parquet_path = os.path.join(DATA_DIR, "repos.parquet")
-
-    # Cargar repos existentes
-    if os.path.exists(repos_parquet_path):
-        existing_repos = pd.read_parquet(repos_parquet_path)
-        if "processed" not in existing_repos.columns:
-            existing_repos["processed"] = True
-        elif existing_repos["processed"].isnull().any():
-            existing_repos["processed"] = existing_repos["processed"].fillna(True)
-            existing_repos.to_parquet(
-                repos_parquet_path, index=False, engine=PARQUET_ENGINE
-            )
-        existing_set = set(existing_repos["repo"])
-        logging.info(f"📚 Cargados {len(existing_set)} repos existentes")
-        del existing_repos
-        gc.collect()
-    else:
-        existing_set = set()
-        logging.info("📝 Iniciando desde cero")
-
     last_progress_log = time.time()
 
-    # Configurar sesión HTTP asíncrona
-    timeout = aiohttp.ClientTimeout(total=30, connect=10)
+    # Configurar sesión HTTP asíncrona con timeouts más generosos
+    timeout = aiohttp.ClientTimeout(total=60, connect=15)
     connector = aiohttp.TCPConnector(
-        limit=MAX_CONCURRENT_REQUESTS, limit_per_host=SEMAPHORE_LIMIT
+        limit=MAX_CONCURRENT_REQUESTS,
+        limit_per_host=SEMAPHORE_LIMIT,
+        ttl_dns_cache=300,
+        use_dns_cache=True,
     )
 
     try:
@@ -760,74 +874,91 @@ async def main():
         ) as session:
 
             while True:
-                # Verificar si es tiempo de crear backup
-                if time.time() - stats["last_backup"] > BACKUP_TIMEOUT:
-                    backup_data_folder()
+                try:
+                    # Verificar si es tiempo de crear backup
+                    if time.time() - stats["last_backup"] > BACKUP_TIMEOUT:
+                        backup_data_folder()
 
-                # Verificar si es tiempo de procesar usuarios
-                if should_process_users():
-                    await process_users_cycle_async(session)
+                    # Verificar si es tiempo de procesar usuarios
+                    if should_process_users():
+                        await process_users_cycle_async(session)
 
-                # Procesar repositorios no procesados primero
-                unprocessed_repos = get_unprocessed_repos()
-                if unprocessed_repos:
+                    # Procesar repositorios no procesados primero (usar BD si está disponible)
+                    unprocessed_repos = get_unprocessed_repos_db(50)
+
+                    if unprocessed_repos:
+                        logging.info(
+                            f"🔄 Procesando {len(unprocessed_repos)} repositorios pendientes concurrentemente..."
+                        )
+
+                        # Procesar en lotes pequeños para no sobrecargar
+                        batch_size = min(
+                            5, len(unprocessed_repos)
+                        )  # Lotes más pequeños
+                        for i in range(0, len(unprocessed_repos), batch_size):
+                            batch = unprocessed_repos[i : i + batch_size]
+                            logging.info(f"🚀 Procesando repositorios: {batch}")
+                            await process_repos_concurrently(session, batch)
+
+                            update_status()
+
+                            if time.time() - last_progress_log > 300:
+                                log_progress()
+                                last_progress_log = time.time()
+
+                            # Pausa más larga entre lotes para ser más respetuoso con la API
+                            await asyncio.sleep(5)
+
+                        continue  # Volver al inicio del loop para verificar más repos pendientes
+
+                    # Continuar con el flujo normal si no hay repos pendientes
                     logging.info(
-                        f"🔄 Procesando {len(unprocessed_repos)} repositorios pendientes concurrentemente..."
+                        f"📖 Procesando página {stats['pages_processed'] + 1}..."
+                    )
+                    repos = await get_repos_by_topic_async(
+                        session,
+                        "python",
+                        per_page=10,
+                        page=stats["pages_processed"] + 1,
                     )
 
-                    # Procesar en lotes para no sobrecargar
-                    batch_size = min(MAX_CONCURRENT_REQUESTS, len(unprocessed_repos))
-                    for i in range(0, len(unprocessed_repos), batch_size):
-                        batch = unprocessed_repos[i : i + batch_size]
-                        await process_repos_concurrently(session, batch, existing_set)
+                    if not repos:
+                        logging.info("🏁 No hay más repositorios para procesar")
+                        break
 
-                        update_status()
+                    # Filtrar repos que ya existen
+                    new_repos = []
+                    for r in repos:
+                        owner, name = r["owner"]["login"], r["name"]
+                        name = f"{owner}/{name}"
+                        r["repo"] = name
+                        r["owner"] = owner
+                        r["created_at"] = r.get("created_at", "")
+                        r["updated_at"] = r.get("updated_at", "")
+                        new_repos.append(name)
 
-                        if time.time() - last_progress_log > 300:
-                            log_progress()
-                            last_progress_log = time.time()
+                    # Procesar nuevos repos concurrentemente
+                    add_new_repos(repos)
+                    if new_repos:
+                        logging.info(
+                            f"🚀 Procesando {len(new_repos)} nuevos repositorios concurrentemente..."
+                        )
+                        await process_repos_concurrently(session, new_repos)
 
-                        # Pequeña pausa entre lotes para no saturar la API
-                        await asyncio.sleep(2)
+                    update_status()
 
-                    continue  # Volver al inicio del loop para verificar más repos pendientes
+                    if time.time() - last_progress_log > 300:
+                        log_progress()
+                        last_progress_log = time.time()
 
-                # Continuar con el flujo normal si no hay repos pendientes
-                logging.info(f"📖 Procesando página {stats['pages_processed']}...")
-                repos = await get_repos_by_topic_async(
-                    session, "python", per_page=10, page=stats["pages_processed"]
-                )
+                    stats["pages_processed"] += 1
+                    await asyncio.sleep(3)  # Pausa más larga entre páginas
 
-                if not repos:
-                    logging.info("🏁 No hay más repositorios para procesar")
-                    break
-
-                # Filtrar repos que ya existen
-                new_repos = []
-                for r in repos:
-                    owner, name = r["owner"]["login"], r["name"]
-                    repo_key = f"{owner}/{name}"
-
-                    if repo_key not in existing_set:
-                        new_repos.append((owner, name))
-                    else:
-                        logging.info(f"⏭️ {repo_key} ya existe, saltando")
-
-                # Procesar nuevos repos concurrentemente
-                if new_repos:
-                    logging.info(
-                        f"🚀 Procesando {len(new_repos)} nuevos repositorios concurrentemente..."
-                    )
-                    await process_repos_concurrently(session, new_repos, existing_set)
-
-                update_status()
-
-                if time.time() - last_progress_log > 300:
-                    log_progress()
-                    last_progress_log = time.time()
-
-                stats["pages_processed"] += 1
-                await asyncio.sleep(2)  # Pausa entre páginas
+                except Exception as e:
+                    logging.error(f"💥 Error en loop principal: {e}")
+                    stats["errors"] += 1
+                    await asyncio.sleep(30)  # Pausa más larga en caso de error
+                    continue
 
     except KeyboardInterrupt:
         logging.info("🛑 Interrupción manual detectada")
