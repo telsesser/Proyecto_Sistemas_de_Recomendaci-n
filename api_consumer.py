@@ -44,10 +44,11 @@ MAX_USERS_TO_PROCESS = 2  # Máximo usuarios a procesar por ciclo
 BACKUP_TIMEOUT = 3600  # 1 hora
 
 # CONFIGURACIÓN ASÍNCRONA
-MAX_CONCURRENT_REQUESTS = 2  # Máximo requests concurrentes
-SEMAPHORE_LIMIT = 2  # limite de conexiones simultaneas a la API
+MAX_CONCURRENT_REQUESTS = 10  # Máximo requests concurrentes
+SEMAPHORE_LIMIT = 5  # limite de conexiones simultaneas a la API
 REPOS_BATCH_SIZE = 4  # Número de repos a procesar en paralelo
 SEMAPHORE_REPO_LIMIT = 2  # Límite DE procesamiento de repositorios en simultáneo
+SEMAPHORE_USER_LIMIT = 5  # Límite de procesamiento de usuarios en simultáneo
 
 REQUEST_DELAY = 0.5  # Aumentado para evitar rate limiting
 
@@ -231,10 +232,22 @@ def init_db():
     CREATE TABLE IF NOT EXISTS repos (
         repo TEXT PRIMARY KEY,
         owner TEXT,
-        processed INTEGER DEFAULT 0,
+        is_fork INTEGER,
+        stars INTEGER,
+        forks INTEGER,
+        watchers INTEGER,
+        open_issues INTEGER,
+        has_issues INTEGER,
+        has_projects INTEGER,
+        has_wiki INTEGER,
+        has_pages INTEGER,
+        has_downloads INTEGER,
         created_at TEXT,
-        updated_at TEXT
+        updated_at TEXT,
+        topics TEXT,
+        processed INTEGER DEFAULT 0
     )
+
     """
     )
 
@@ -259,6 +272,7 @@ def init_db():
         if os.path.exists(users_path):
             try:
                 users_df = pd.read_parquet(users_path, engine=PARQUET_ENGINE)
+
                 if not users_df.empty:
                     cur.executemany(
                         "INSERT OR IGNORE INTO users(user, processed, stars_count) VALUES (?, ?, ?)",
@@ -276,11 +290,31 @@ def init_db():
             try:
                 repos_df = pd.read_parquet(repos_path, engine=PARQUET_ENGINE)
                 if not repos_df.empty:
+
                     cur.executemany(
-                        """INSERT OR IGNORE INTO repos(repo, owner, processed, created_at, updated_at)
-                           VALUES (?, ?, ?, ?, ?)""",
+                        """INSERT OR IGNORE INTO repos(repo, owner, is_fork, stars, forks, watchers,
+                        "open_issues", "has_issues", "has_projects", "has_wiki", "has_pages", "has_downloads",
+                        created_at, updated_at, topics, processed)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         repos_df[
-                            ["repo", "owner", "processed", "created_at", "updated_at"]
+                            [
+                                "repo",
+                                "owner",
+                                "is_fork",
+                                "stars",
+                                "forks",
+                                "watchers",
+                                "open_issues",
+                                "has_issues",
+                                "has_projects",
+                                "has_wiki",
+                                "has_pages",
+                                "has_downloads",
+                                "created_at",
+                                "updated_at",
+                                "topics",
+                                "processed",
+                            ]
                         ].itertuples(index=False, name=None),
                     )
                     logging.info(f"→ Migrados {len(repos_df)} repositorios")
@@ -289,6 +323,178 @@ def init_db():
 
         conn.commit()
 
+    # Migrar de repos.parquet la informacion extras a db
+    repos_path = os.path.join(DATA_DIR, "repos.parquet")
+    if os.path.exists(repos_path):
+        try:
+            ## agregar columnas si no existen
+            columns_to_add = {
+                "is_fork": "INTEGER",
+                "stars": "INTEGER",
+                "forks": "INTEGER",
+                "watchers": "INTEGER",
+                "open_issues": "INTEGER",
+                "has_issues": "INTEGER",
+                "has_projects": "INTEGER",
+                "has_wiki": "INTEGER",
+                "has_pages": "INTEGER",
+                "has_downloads": "INTEGER",
+                "created_at": "TEXT",
+                "updated_at": "TEXT",
+                "topics": "TEXT",
+            }
+
+            for col_name, col_type in columns_to_add.items():
+                try:
+                    cur.execute(f"ALTER TABLE repos ADD COLUMN {col_name} {col_type}")
+                except sqlite3.OperationalError as e:
+                    # Si la columna ya existe, ignora el error
+                    if "duplicate column name" in str(e).lower():
+                        pass
+                    else:
+                        raise
+            repos_df = pd.read_parquet(repos_path, engine=PARQUET_ENGINE)
+            if not repos_df.empty:
+                cur.executemany(
+                    """UPDATE repos SET
+                    is_fork=?, stars=?, forks=?, watchers=?, open_issues=?,
+                    has_issues=?, has_projects=?, has_wiki=?, has_pages=?, has_downloads=?,
+                    created_at=?, updated_at=?, topics=?
+                    WHERE repo=?""",
+                    repos_df[
+                        [
+                            "is_fork",
+                            "stars",
+                            "forks",
+                            "watchers",
+                            "open_issues",
+                            "has_issues",
+                            "has_projects",
+                            "has_wiki",
+                            "has_pages",
+                            "has_downloads",
+                            "created_at",
+                            "updated_at",
+                            "topics",
+                            "repo",
+                        ]
+                    ].itertuples(index=False, name=None),
+                )
+                logging.info(f"→ Actualizados {len(repos_df)} repositorios")
+        except Exception as e:
+            logging.error(f"Error actualizando repos: {e}")
+
+    conn.execute(
+        """
+    CREATE TABLE IF NOT EXISTS stargazers (
+        repo TEXT,
+        user TEXT,
+        timestamp TEXT,
+        PRIMARY KEY (repo, user)
+    )
+    """
+    )
+    conn.commit()
+    stargazers_path = os.path.join(DATA_DIR, "stargazers.parquet")
+    if os.path.exists(stargazers_path):
+        try:
+            stargazers_df = pd.read_parquet(stargazers_path, engine=PARQUET_ENGINE)
+            if not stargazers_df.empty:
+                cur.executemany(
+                    "INSERT OR IGNORE INTO stargazers(repo, user, timestamp) VALUES (?, ?, ?)",
+                    stargazers_df[["repo", "user", "timestamp"]].itertuples(
+                        index=False, name=None
+                    ),
+                )
+                logging.info(f"→ Migrados {len(stargazers_df)} stargazers")
+        except Exception as e:
+            logging.error(f"Error migrando stargazers: {e}")
+    conn.commit()
+
+    conn.execute(
+        """
+    CREATE TABLE IF NOT EXISTS contributors (
+        repo TEXT,
+        user TEXT,
+        commits INTEGER,
+        PRIMARY KEY (repo, user)
+    )
+    """
+    )
+    conn.commit()
+    contributors_path = os.path.join(DATA_DIR, "contributors.parquet")
+    if os.path.exists(contributors_path):
+        try:
+            contributors_df = pd.read_parquet(contributors_path, engine=PARQUET_ENGINE)
+            if not contributors_df.empty:
+                cur.executemany(
+                    "INSERT OR IGNORE INTO contributors(repo, user, commits) VALUES (?, ?, ?)",
+                    contributors_df[["repo", "user", "commits"]].itertuples(
+                        index=False, name=None
+                    ),
+                )
+                logging.info(f"→ Migrados {len(contributors_df)} contributors")
+        except Exception as e:
+            logging.error(f"Error migrando contributors: {e}")
+    conn.commit()
+
+    conn.execute(
+        """
+    CREATE TABLE IF NOT EXISTS forks (
+        repo TEXT,
+        user TEXT,
+        timestamp TEXT,
+        name TEXT,
+        url TEXT,
+        PRIMARY KEY (url)
+    )
+    """
+    )
+
+    conn.commit()
+    forks_path = os.path.join(DATA_DIR, "forks.parquet")
+    if os.path.exists(forks_path):
+        try:
+            forks_df = pd.read_parquet(forks_path, engine=PARQUET_ENGINE)
+            if not forks_df.empty:
+                cur.executemany(
+                    "INSERT OR IGNORE INTO forks(repo, user, timestamp, name, url) VALUES (?, ?, ?, ?, ?)",
+                    forks_df[["repo", "user", "timestamp", "name", "url"]].itertuples(
+                        index=False, name=None
+                    ),
+                )
+                logging.info(f"→ Migrados {len(forks_df)} forks")
+        except Exception as e:
+            logging.error(f"Error migrando forks: {e}")
+    conn.commit()
+
+    conn.execute(
+        """
+    CREATE TABLE IF NOT EXISTS issues (
+        repo TEXT,
+        user TEXT,
+        timestamp TEXT,
+        url TEXT,
+        PRIMARY KEY (repo, user, url)
+    )
+    """
+    )
+    conn.commit()
+    issues_path = os.path.join(DATA_DIR, "issues.parquet")
+    if os.path.exists(issues_path):
+        try:
+            issues_df = pd.read_parquet(issues_path, engine=PARQUET_ENGINE)
+            if not issues_df.empty:
+                cur.executemany(
+                    "INSERT OR IGNORE INTO issues(repo, user, timestamp, url) VALUES (?, ?, ?, ?)",
+                    issues_df[["repo", "user", "timestamp", "url"]].itertuples(
+                        index=False, name=None
+                    ),
+                )
+                logging.info(f"→ Migrados {len(issues_df)} issues")
+        except Exception as e:
+            logging.error(f"Error migrando issues: {e}")
+    conn.commit()
     conn.close()
 
 
@@ -375,6 +581,24 @@ def update_processed_users(users: List[str]):
     conn.close()
 
 
+def update_users_from_stargazers_db():
+    """Añade nuevos usuarios desde la tabla de stargazers"""
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT OR IGNORE INTO users(user, processed, stars_count)
+        SELECT DISTINCT user, 0, 0 FROM stargazers
+        WHERE user NOT IN (SELECT user FROM users)
+        """
+    )
+    new_users_count = cur.rowcount
+    conn.commit()
+    conn.close()
+    if new_users_count > 0:
+        logging.info(f"🆕 Agregados {new_users_count} nuevos usuarios desde stargazers")
+
+
 def is_repo_processed(repo_key: str) -> bool:
     """Verifica si un repositorio ya ha sido procesado"""
     conn = get_db_conn()
@@ -422,48 +646,21 @@ def load_stats_from_db():
     cur.execute("SELECT COUNT(*) FROM repos")
     stats["repos_fetched"] = cur.fetchone()[0]
 
+    cur.execute("SELECT COUNT(*) FROM stargazers")
+    stats["stargazers_fetched"] = cur.fetchone()[0]
+
+    cur.execute("SELECT COUNT(*) FROM contributors")
+    stats["contributors_fetched"] = cur.fetchone()[0]
+
+    cur.execute("SELECT COUNT(*) FROM forks")
+    stats["forks_fetched"] = cur.fetchone()[0]
+
+    cur.execute("SELECT COUNT(*) FROM issues")
+    stats["issues_fetched"] = cur.fetchone()[0]
+
     conn.close()
     logging.info(
         f"Estadísticas cargadas desde DB: {stats['repos_processed']} repos, {stats['users_processed']} usuarios procesados"
-    )
-
-
-def load_stats_from_parquet():
-    """Carga estadísticas desde archivos parquet al iniciar"""
-    global stats
-
-    # Cargar repos procesados
-    stargazers_path = os.path.join(DATA_DIR, "stargazers.parquet")
-    if os.path.exists(stargazers_path):
-        try:
-            df = pd.read_parquet(stargazers_path, engine=PARQUET_ENGINE)
-            stats["stargazers_fetched"] = len(df)
-        except Exception as e:
-            logging.error(f"Error cargando stargazers.parquet: {e}")
-    contributors_path = os.path.join(DATA_DIR, "contributors.parquet")
-    if os.path.exists(contributors_path):
-        try:
-            df = pd.read_parquet(contributors_path, engine=PARQUET_ENGINE)
-            stats["contributors_fetched"] = len(df)
-        except Exception as e:
-            logging.error(f"Error cargando contributors.parquet: {e}")
-    forks_path = os.path.join(DATA_DIR, "forks.parquet")
-    if os.path.exists(forks_path):
-        try:
-            df = pd.read_parquet(forks_path, engine=PARQUET_ENGINE)
-            stats["forks_fetched"] = len(df)
-        except Exception as e:
-            logging.error(f"Error cargando forks.parquet: {e}")
-    issues_path = os.path.join(DATA_DIR, "issues.parquet")
-    if os.path.exists(issues_path):
-        try:
-            df = pd.read_parquet(issues_path, engine=PARQUET_ENGINE)
-            stats["issues_fetched"] = len(df)
-        except Exception as e:
-            logging.error(f"Error cargando issues.parquet: {e}")
-    gc.collect()
-    logging.info(
-        f"Estadísticas cargadas desde parquet: {stats['stargazers_fetched']} stargazers, {stats['contributors_fetched']} contributors, {stats['forks_fetched']} forks, {stats['issues_fetched']} issues"
     )
 
 
@@ -579,42 +776,45 @@ async def get_paginated_async(
                 await asyncio.sleep(2**attempt)  # 1s, 2s, 4s
 
 
-def save_data_batch(data_list: List[Dict], file_path: str, columns=None):
+def save_data_batch(data_list: List[Dict], table_name: str, columns=None):
     """
-    Guarda datos en lotes de forma más eficiente en memoria
+    Guarda datos en SQLite de forma eficiente en memoria.
+    - data_list: lista de diccionarios
+    - table_name: nombre de la tabla
+    - columns: lista opcional de columnas a guardar
     """
     if not data_list:
         return
 
     try:
-        df = pd.DataFrame(data_list)
+        # Conexión
+        conn = get_db_conn()
+        cur = conn.cursor()
 
-        if os.path.exists(file_path):
-            # Usar modo append si el engine lo soporta
-            if PARQUET_ENGINE == "fastparquet":
-                # fastparquet soporta append
-                df.to_parquet(
-                    file_path, index=False, engine=PARQUET_ENGINE, append=True
-                )
-            else:
-                # pyarrow: leer, concatenar y escribir
-                existing_df = pd.read_parquet(file_path, engine=PARQUET_ENGINE)
-                combined_df = pd.concat([existing_df, df], ignore_index=True)
-                combined_df.to_parquet(file_path, index=False, engine=PARQUET_ENGINE)
-                del existing_df, combined_df
-        else:
-            df.to_parquet(file_path, index=False, engine=PARQUET_ENGINE)
+        if columns is None:
+            columns = list(data_list[0].keys())
 
-        # Si es stargazers, añadir usuarios únicos
-        if file_path.endswith("stargazers.parquet") and "user" in df.columns:
-            unique_users = df["user"].unique().tolist()
-            add_new_users(unique_users)
+        # Preparar inserción en batch
+        placeholders = ", ".join(["?" for _ in columns])
+        insert_sql = f"INSERT OR IGNORE INTO {table_name} ({', '.join(columns)}) VALUES ({placeholders})"
 
-        del df
+        # Convertir data_list a tupla de valores en el orden de columns
+        values = [tuple(item.get(col, None) for col in columns) for item in data_list]
+        print(f"Guardando {len(values)} registros en {table_name}... {insert_sql}")
+
+        cur.executemany(insert_sql, values)
+        conn.commit()
+        conn.close()
+
+        # Limpieza
+        del values
         gc.collect()
 
     except Exception as e:
-        logging.error(f"❌ Error guardando datos en {file_path}: {e}")
+        logging.error(
+            f"❌ Error guardando datos en SQLite tabla {table_name}: {e}"
+            f"{''.join(traceback.format_exception(type(e), e, e.__traceback__))}"
+        )
 
 
 async def get_repos_by_topic_async(
@@ -694,13 +894,13 @@ async def fetch_repo_endpoint(
 
         # Procesar en lotes para evitar acumulación en memoria
         if len(data) >= BATCH_SIZE:
-            save_data_batch(data, os.path.join(DATA_DIR, f"{endpoint_name}.parquet"))
+            save_data_batch(data, endpoint_name)
             stats[f"{endpoint_name}_fetched"] += len(data)
             data = []  # Limpiar lista
 
     # Guardar resto si queda algo
     if data:
-        save_data_batch(data, os.path.join(DATA_DIR, f"{endpoint_name}.parquet"))
+        save_data_batch(data, endpoint_name)
         stats[f"{endpoint_name}_fetched"] += len(data)
 
     return []  # Retornamos lista vacía ya que guardamos directamente
@@ -737,9 +937,9 @@ async def get_repo_data_async(
         "created_at": repo_json.get("created_at", ""),
         "updated_at": repo_json.get("updated_at", ""),
         "topics": ",".join(repo_json.get("topics", [])),
-        "processed": True,
+        "processed": False,
     }
-
+    save_data_batch([repo_info], "repos")
     # Crear tareas concurrentes para todos los endpoints
     endpoints = [
         (f"{BASE_URL}/repos/{repo_key}/stargazers", "stargazers"),
@@ -769,6 +969,7 @@ async def get_repo_data_async(
             # f"{''.join(traceback.format_exception(type(result), result, result.__traceback__))}"
 
     stats["repos_processed"] += 1
+    mark_repo_as_processed_db(repo_key)
     logging.info(
         f"✅ {repo_key} completado (async) - ({stats['repos_processed']} repos totales)"
     )
@@ -780,7 +981,7 @@ async def get_repo_data_async(
             f"🧹 Garbage collection ejecutado (repo #{stats['repos_processed']})"
         )
 
-    return repo_info, [], [], [], []
+    return
 
 
 async def process_users_cycle_async(session: aiohttp.ClientSession):
@@ -788,7 +989,8 @@ async def process_users_cycle_async(session: aiohttp.ClientSession):
     global stats
 
     logging.info("🔄 Iniciando ciclo de procesamiento de usuarios (async)...")
-
+    # Añadir nuevos usuarios desde stargazers no procesados
+    update_users_from_stargazers_db()
     # Obtener usuarios únicos no procesados de la base de datos
     unprocessed_users = get_unprocessed_users_db(MAX_USERS_TO_PROCESS)
 
@@ -804,6 +1006,7 @@ async def process_users_cycle_async(session: aiohttp.ClientSession):
         logging.info(f"👤 Procesando usuario: {user}")
 
         new_repos = []
+        starred_repos = []
         user_starred_count = 0
 
         try:
@@ -838,14 +1041,23 @@ async def process_users_cycle_async(session: aiohttp.ClientSession):
                         "processed": False,
                     }
                     new_repos.append(new_repo_info)
+                    starred_repos.append(
+                        {
+                            "repo": repo_key,
+                            "user": user,
+                            "timestamp": item.get("starred_at", ""),
+                        }
+                    )
 
         except Exception as e:
             logging.error(f"❌ Error procesando usuario {user}: {e}")
 
-        return user, new_repos, user_starred_count
+        return user, new_repos, user_starred_count, starred_repos
 
     # Ejecutar procesamiento de usuarios con límite de concurrencia
-    semaphore = asyncio.Semaphore(3)  # Límite más conservador para usuarios
+    semaphore = asyncio.Semaphore(
+        SEMAPHORE_USER_LIMIT
+    )  # Límite más conservador para usuarios
 
     async def bounded_process_user(user: str):
         async with semaphore:
@@ -863,17 +1075,21 @@ async def process_users_cycle_async(session: aiohttp.ClientSession):
             logging.error(f"❌ Error procesando usuario: {result}")
             continue
 
-        user, new_repos, stars_count = result
+        user, new_repos, stars_count, starred_repos = result
         all_new_repos.extend(new_repos)
         processed_users.append(user)
 
         # Actualizar stars_count para el usuario
         add_user_stars_count(user, stars_count)
+
+        # Guardar repositorios estrellados en la base de datos
+        if starred_repos:
+            save_data_batch(starred_repos, "stargazers")
         stats["users_processed"] += 1
 
     # Guardar nuevos repos en la base de datos
     if all_new_repos:
-        add_new_repos(all_new_repos)
+        save_data_batch(all_new_repos, "repos")
         logging.info(
             f"🆕 Agregados {len(all_new_repos)} nuevos repositorios para procesar"
         )
@@ -906,11 +1122,7 @@ async def process_repos_concurrently(
             logging.info(f"ℹ️ {repo_key} ya procesado, saltando...")
             return True
         try:
-            result = await get_repo_data_async(session, owner, name)
-            if result[0] is not None:
-                repo_info = result[0]
-                save_data_batch([repo_info], os.path.join(DATA_DIR, "repos.parquet"))
-                mark_repo_as_processed_db(repo_key)
+            await get_repo_data_async(session, owner, name)
             update_status()
             return True
         except Exception as e:
@@ -948,7 +1160,6 @@ async def main():
     # Inicializar base de datos
     init_db()
     load_stats_from_db()
-    load_stats_from_parquet()
 
     if not os.path.exists(DATA_DIR):
         os.makedirs(DATA_DIR)
@@ -1033,7 +1244,6 @@ async def main():
                         new_repos.append(name)
 
                     # Procesar nuevos repos concurrentemente
-                    add_new_repos(repos)
                     if new_repos:
                         logging.info(
                             f"🚀 Procesando {len(new_repos)} nuevos repositorios concurrentemente..."
