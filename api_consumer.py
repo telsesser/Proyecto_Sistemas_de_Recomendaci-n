@@ -309,7 +309,7 @@ def init_db():
     conn.close()
 
 
-def add_new_users(users: List[(int, str)]):
+def add_new_users(users: List[Tuple[int, str]]):
     """Añade nuevos usuarios a la base de datos"""
     if not users:
         return
@@ -328,8 +328,8 @@ def get_unprocessed_users_db(limit=MAX_USERS_TO_PROCESS):
     """Obtiene usuarios no procesados de la base de datos"""
     conn = get_db_conn()
     cur = conn.cursor()
-    cur.execute("SELECT user, id_user FROM users WHERE processed=0 LIMIT ?", (limit,))
-    users = [(r[0], r[1]) for r in cur.fetchall()]
+    cur.execute("SELECT  id_user FROM users WHERE processed=0 LIMIT ?", (limit,))
+    users = [(r[0]) for r in cur.fetchall()]
     conn.close()
     return users
 
@@ -399,6 +399,14 @@ def update_processed_users(users: List[int]):
     conn.close()
 
 
+def update_user_name(id_user: int, user_name: str):
+    """Actualiza el nombre de usuario en la base de datos"""
+    conn = get_db_conn()
+    conn.execute("UPDATE users SET user=? WHERE id_user=?", (user_name, id_user))
+    conn.commit()
+    conn.close()
+
+
 def update_users_from_stargazers_db():
     """Añade nuevos usuarios desde la tabla de stargazers"""
     conn = get_db_conn()
@@ -425,6 +433,16 @@ def is_repo_processed(id_repo: int) -> bool:
     row = cur.fetchone()
     conn.close()
     return row is not None and row[0] == 1
+
+
+def there_are_unprocessed_users() -> bool:
+    """Verifica si existen usuarios no procesados"""
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT id_user FROM users WHERE processed=0 LIMIT 1")
+    row = cur.fetchone()
+    conn.close()
+    return row is not None
 
 
 async def handle_rate_limit(response_headers: dict) -> bool:
@@ -693,8 +711,7 @@ async def fetch_repo_endpoint(
                                     item.get("created_at", ""), "%Y-%m-%dT%H:%M:%SZ"
                                 ).timestamp()
                             ),
-                            "name": item.get("full_name", ""),
-                            "url": item.get("html_url", ""),
+                            "id_fork": item["id"],
                         }
                     )
                 elif endpoint_name == "issues":
@@ -708,7 +725,6 @@ async def fetch_repo_endpoint(
                                         item.get("created_at", ""), "%Y-%m-%dT%H:%M:%SZ"
                                     ).timestamp()
                                 ),
-                                "url": item.get("html_url", ""),
                             }
                         )
             except KeyError as e:
@@ -841,17 +857,26 @@ async def process_users_cycle_async(session: aiohttp.ClientSession):
     logging.info(f"👤 Procesando {len(unprocessed_users)} usuarios...")
 
     # Procesar usuarios concurrentemente
-    async def process_single_user(
-        user: str, id_user: int
-    ) -> Tuple[str, List[Dict], int]:
+    async def process_single_user(id_user: int) -> Tuple[str, List[Dict], int]:
         """Procesa un usuario individual de forma asíncrona"""
-        logging.info(f"👤 Procesando usuario: {user}")
+        logging.info(f"👤 Procesando usuario: {id_user}")
 
         new_repos = []
         starred_repos = []
         user_starred_count = 0
 
         try:
+            # obtener información del usuario
+            user_json = await github_request_async(
+                session, f"{BASE_URL}/user/{id_user}"
+            )
+            if not user_json:
+                raise ValueError("No se pudo obtener información del usuario")
+            user = user_json.get("login", "")
+            if not user:
+                raise ValueError("Usuario sin login válido")
+            update_user_name(id_user, user_json.get("login", ""))
+
             # Obtener repositorios estrellados por el usuario usando paginación asíncrona
             async for batch in get_paginated_async(
                 session, f"{BASE_URL}/users/{user}/starred"
@@ -905,23 +930,24 @@ async def process_users_cycle_async(session: aiohttp.ClientSession):
                         }
                     )
 
-        except Exception as e:
-            logging.error(f"❌ Error procesando usuario {user}: {e}")
+            return user, new_repos, user_starred_count, starred_repos
 
-        return user, new_repos, user_starred_count, starred_repos
+        except Exception as e:
+            logging.error(
+                f"❌ Error procesando usuarios: {e}",
+                f"{''.join(traceback.format_exception(type(e), e, e.__traceback__))}",
+            )
 
     # Ejecutar procesamiento de usuarios con límite de concurrencia
     semaphore = asyncio.Semaphore(
         SEMAPHORE_USER_LIMIT
     )  # Límite más conservador para usuarios
 
-    async def bounded_process_user(user: str, id_user: int):
+    async def bounded_process_user(id_user: int):
         async with semaphore:
-            return await process_single_user(user, id_user)
+            return await process_single_user(id_user)
 
-    user_tasks = [
-        bounded_process_user(user, id_user) for (user, id_user) in unprocessed_users
-    ]
+    user_tasks = [bounded_process_user(id_user) for id_user in unprocessed_users]
     user_results = await asyncio.gather(*user_tasks, return_exceptions=True)
 
     # Procesar resultados
@@ -961,14 +987,9 @@ async def process_users_cycle_async(session: aiohttp.ClientSession):
     logging.info("🔄 Ciclo de procesamiento de usuarios completado (async)")
 
 
-def should_process_users():
-    """Determina si es tiempo de procesar usuarios"""
-    return (time.time() - stats["last_user_processing"]) >= USER_PROCESSING_INTERVAL
-
-
 async def process_repos_concurrently(
     session: aiohttp.ClientSession,
-    repos_to_process: List[(str, int, int)],
+    repos_to_process: List[Tuple[str, int, int]],
 ):
     """Procesa múltiples repositorios concurrentemente"""
 
@@ -1052,11 +1073,13 @@ async def main():
                         backup_data_folder()
 
                     # Verificar si es tiempo de procesar usuarios
-                    if should_process_users():
+                    b = there_are_unprocessed_users()
+                    logging.warning(f"⏰ Verificando ciclo de usuarios... {b}")
+                    if b:
                         await process_users_cycle_async(session)
 
                     # Procesar repositorios no procesados primero (usar BD si está disponible)
-                    unprocessed_repos = get_unprocessed_repos_db(50)
+                    unprocessed_repos = get_unprocessed_repos_db(100)
 
                     if unprocessed_repos:
                         logging.info(
@@ -1121,7 +1144,7 @@ async def main():
                     await asyncio.sleep(3)  # Pausa más larga entre páginas
 
                 except Exception as e:
-                    logging.error(f"💥 Error en loop principal: {e}")
+                    logging.error(f"💥 Error en loop principal: {e}", exc_info=True)
                     stats["errors"] += 1
                     await asyncio.sleep(30)  # Pausa más larga en caso de error
                     continue
