@@ -977,12 +977,50 @@ async def main():
         logging.info("🏁 Script finalizado")
 
 
+async def shutdown(signal, loop):
+    """Cleanup resources and shutdown gracefully"""
+    logging.info(f"Received exit signal {signal.name}...")
+
+    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+
+    for task in tasks:
+        task.cancel()
+
+    logging.info(f"Cancelling {len(tasks)} outstanding tasks")
+    await asyncio.gather(*tasks, return_exceptions=True)
+    loop.stop()
+    update_status()
+    log_progress()
+    logging.info("🏁 Shutdown complete")
+
+
+def handle_exception(loop, context):
+    """Handle exceptions in the event loop"""
+    msg = context.get("exception", context["message"])
+    logging.error(f"Caught exception: {msg}")
+    logging.info("Shutting down...")
+    asyncio.create_task(shutdown(signal.SIGTERM, loop))
+
+
 if __name__ == "__main__":
-    # Ejecutar el loop asíncrono principal
+    # Configurar el manejo de señales
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    signals = (signal.SIGTERM, signal.SIGINT)
+
+    for s in signals:
+        loop.add_signal_handler(s, lambda s=s: asyncio.create_task(shutdown(s, loop)))
+
+    # Configurar el manejador de excepciones
+    loop.set_exception_handler(handle_exception)
+
     try:
-        asyncio.run(main())
+        loop.run_until_complete(main())
     except KeyboardInterrupt:
-        logging.info("🛑 Interrupción recibida, cerrando...")
+        logging.info("🛑 Interrupción recibida, iniciando cierre seguro...")
     except Exception as e:
         logging.error(f"💥 Error crítico: {e}")
         raise
+    finally:
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.close()
