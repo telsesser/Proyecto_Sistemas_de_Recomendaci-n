@@ -22,15 +22,6 @@ load_dotenv()
 DEBUG = os.getenv("DEBUG", "False").lower() in ("true", "1", "t")
 START_DATE = os.getenv("START_DATE", "2025-01-01")
 
-# Intentar importar fastparquet, usar pyarrow como fallback
-try:
-    import fastparquet
-
-    PARQUET_ENGINE = "fastparquet"
-except ImportError:
-    PARQUET_ENGINE = "pyarrow"
-    logging.warning("fastparquet no disponible, usando pyarrow")
-
 # Configuración para prevenir memory leaks
 MAX_ITEMS_PER_ENDPOINT = 3000  # Límite máximo por endpoint
 BATCH_SIZE = 100  # Procesar en lotes
@@ -230,20 +221,21 @@ def init_db():
     cur.execute(
         """
     CREATE TABLE IF NOT EXISTS repos (
-        repo TEXT PRIMARY KEY,
-        owner TEXT,
+        id_repo INTEGER PRIMARY KEY,
+        repo TEXT,
+        id_owner TEXT,
         is_fork INTEGER,
         stars INTEGER,
         forks INTEGER,
         watchers INTEGER,
         open_issues INTEGER,
-        has_issues INTEGER,
-        has_projects INTEGER,
-        has_wiki INTEGER,
-        has_pages INTEGER,
-        has_downloads INTEGER,
-        created_at TEXT,
-        updated_at TEXT,
+        has_issues BOOLEAN,
+        has_projects BOOLEAN,
+        has_wiki BOOLEAN,
+        has_pages BOOLEAN,
+        has_downloads BOOLEAN,
+        created_at INTEGER,
+        updated_at INTEGER,
         topics TEXT,
         processed INTEGER DEFAULT 0
     )
@@ -254,7 +246,8 @@ def init_db():
     cur.execute(
         """
     CREATE TABLE IF NOT EXISTS users (
-        user TEXT PRIMARY KEY,
+        id_user INTEGER PRIMARY KEY,
+        user TEXT,
         processed INTEGER DEFAULT 0,
         stars_count INTEGER DEFAULT 0
     )
@@ -263,242 +256,60 @@ def init_db():
 
     conn.commit()
 
-    # Si la DB es nueva y existen los parquet → migrar datos
-    if not db_exists:
-        logging.info("Migrando datos de parquet a SQLite...")
-
-        # Migrar users.parquet
-        users_path = os.path.join(DATA_DIR, "users.parquet")
-        if os.path.exists(users_path):
-            try:
-                users_df = pd.read_parquet(users_path, engine=PARQUET_ENGINE)
-
-                if not users_df.empty:
-                    cur.executemany(
-                        "INSERT OR IGNORE INTO users(user, processed, stars_count) VALUES (?, ?, ?)",
-                        users_df[["user", "processed", "stars_count"]].itertuples(
-                            index=False, name=None
-                        ),
-                    )
-                    logging.info(f"→ Migrados {len(users_df)} usuarios")
-            except Exception as e:
-                logging.error(f"Error migrando usuarios: {e}")
-
-        # Migrar repos.parquet
-        repos_path = os.path.join(DATA_DIR, "repos.parquet")
-        if os.path.exists(repos_path):
-            try:
-                repos_df = pd.read_parquet(repos_path, engine=PARQUET_ENGINE)
-                if not repos_df.empty:
-
-                    cur.executemany(
-                        """INSERT OR IGNORE INTO repos(repo, owner, is_fork, stars, forks, watchers,
-                        "open_issues", "has_issues", "has_projects", "has_wiki", "has_pages", "has_downloads",
-                        created_at, updated_at, topics, processed)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                        repos_df[
-                            [
-                                "repo",
-                                "owner",
-                                "is_fork",
-                                "stars",
-                                "forks",
-                                "watchers",
-                                "open_issues",
-                                "has_issues",
-                                "has_projects",
-                                "has_wiki",
-                                "has_pages",
-                                "has_downloads",
-                                "created_at",
-                                "updated_at",
-                                "topics",
-                                "processed",
-                            ]
-                        ].itertuples(index=False, name=None),
-                    )
-                    logging.info(f"→ Migrados {len(repos_df)} repositorios")
-            except Exception as e:
-                logging.error(f"Error migrando repos: {e}")
-
-        conn.commit()
-
-    # Migrar de repos.parquet la informacion extras a db
-    repos_path = os.path.join(DATA_DIR, "repos.parquet")
-    if os.path.exists(repos_path):
-        try:
-            ## agregar columnas si no existen
-            columns_to_add = {
-                "is_fork": "INTEGER",
-                "stars": "INTEGER",
-                "forks": "INTEGER",
-                "watchers": "INTEGER",
-                "open_issues": "INTEGER",
-                "has_issues": "INTEGER",
-                "has_projects": "INTEGER",
-                "has_wiki": "INTEGER",
-                "has_pages": "INTEGER",
-                "has_downloads": "INTEGER",
-                "created_at": "TEXT",
-                "updated_at": "TEXT",
-                "topics": "TEXT",
-            }
-
-            for col_name, col_type in columns_to_add.items():
-                try:
-                    cur.execute(f"ALTER TABLE repos ADD COLUMN {col_name} {col_type}")
-                except sqlite3.OperationalError as e:
-                    # Si la columna ya existe, ignora el error
-                    if "duplicate column name" in str(e).lower():
-                        pass
-                    else:
-                        raise
-            repos_df = pd.read_parquet(repos_path, engine=PARQUET_ENGINE)
-            if not repos_df.empty:
-                cur.executemany(
-                    """UPDATE repos SET
-                    is_fork=?, stars=?, forks=?, watchers=?, open_issues=?,
-                    has_issues=?, has_projects=?, has_wiki=?, has_pages=?, has_downloads=?,
-                    created_at=?, updated_at=?, topics=?
-                    WHERE repo=?""",
-                    repos_df[
-                        [
-                            "is_fork",
-                            "stars",
-                            "forks",
-                            "watchers",
-                            "open_issues",
-                            "has_issues",
-                            "has_projects",
-                            "has_wiki",
-                            "has_pages",
-                            "has_downloads",
-                            "created_at",
-                            "updated_at",
-                            "topics",
-                            "repo",
-                        ]
-                    ].itertuples(index=False, name=None),
-                )
-                logging.info(f"→ Actualizados {len(repos_df)} repositorios")
-        except Exception as e:
-            logging.error(f"Error actualizando repos: {e}")
-
     conn.execute(
         """
     CREATE TABLE IF NOT EXISTS stargazers (
-        repo TEXT,
-        user TEXT,
-        timestamp TEXT,
-        PRIMARY KEY (repo, user)
+        id_repo INTEGER,
+        id_user INTEGER,
+        timestamp INTEGER,
+        PRIMARY KEY (id_repo, id_user)
     )
     """
     )
-    conn.commit()
-    stargazers_path = os.path.join(DATA_DIR, "stargazers.parquet")
-    if os.path.exists(stargazers_path):
-        try:
-            stargazers_df = pd.read_parquet(stargazers_path, engine=PARQUET_ENGINE)
-            if not stargazers_df.empty:
-                cur.executemany(
-                    "INSERT OR IGNORE INTO stargazers(repo, user, timestamp) VALUES (?, ?, ?)",
-                    stargazers_df[["repo", "user", "timestamp"]].itertuples(
-                        index=False, name=None
-                    ),
-                )
-                logging.info(f"→ Migrados {len(stargazers_df)} stargazers")
-        except Exception as e:
-            logging.error(f"Error migrando stargazers: {e}")
     conn.commit()
 
     conn.execute(
         """
     CREATE TABLE IF NOT EXISTS contributors (
-        repo TEXT,
-        user TEXT,
+        id_repo INTEGER,
+        id_user INTEGER,
         commits INTEGER,
-        PRIMARY KEY (repo, user)
+        PRIMARY KEY (id_repo, id_user)
     )
     """
     )
-    conn.commit()
-    contributors_path = os.path.join(DATA_DIR, "contributors.parquet")
-    if os.path.exists(contributors_path):
-        try:
-            contributors_df = pd.read_parquet(contributors_path, engine=PARQUET_ENGINE)
-            if not contributors_df.empty:
-                cur.executemany(
-                    "INSERT OR IGNORE INTO contributors(repo, user, commits) VALUES (?, ?, ?)",
-                    contributors_df[["repo", "user", "commits"]].itertuples(
-                        index=False, name=None
-                    ),
-                )
-                logging.info(f"→ Migrados {len(contributors_df)} contributors")
-        except Exception as e:
-            logging.error(f"Error migrando contributors: {e}")
     conn.commit()
 
     conn.execute(
         """
     CREATE TABLE IF NOT EXISTS forks (
-        repo TEXT,
-        user TEXT,
-        timestamp TEXT,
-        name TEXT,
-        url TEXT,
-        PRIMARY KEY (url)
+        id_repo INTEGER,
+        id_user INTEGER,
+        timestamp INTEGER,
+        id_fork INTEGER,
+        PRIMARY KEY (id_fork)
     )
     """
     )
 
-    conn.commit()
-    forks_path = os.path.join(DATA_DIR, "forks.parquet")
-    if os.path.exists(forks_path):
-        try:
-            forks_df = pd.read_parquet(forks_path, engine=PARQUET_ENGINE)
-            if not forks_df.empty:
-                cur.executemany(
-                    "INSERT OR IGNORE INTO forks(repo, user, timestamp, name, url) VALUES (?, ?, ?, ?, ?)",
-                    forks_df[["repo", "user", "timestamp", "name", "url"]].itertuples(
-                        index=False, name=None
-                    ),
-                )
-                logging.info(f"→ Migrados {len(forks_df)} forks")
-        except Exception as e:
-            logging.error(f"Error migrando forks: {e}")
     conn.commit()
 
     conn.execute(
         """
     CREATE TABLE IF NOT EXISTS issues (
-        repo TEXT,
-        user TEXT,
-        timestamp TEXT,
-        url TEXT,
-        PRIMARY KEY (repo, user, url)
+        id_repo INTEGER,
+        id_user INTEGER,
+        timestamp INTEGER,
+        PRIMARY KEY (id_repo, id_user, timestamp)
     )
     """
     )
     conn.commit()
-    issues_path = os.path.join(DATA_DIR, "issues.parquet")
-    if os.path.exists(issues_path):
-        try:
-            issues_df = pd.read_parquet(issues_path, engine=PARQUET_ENGINE)
-            if not issues_df.empty:
-                cur.executemany(
-                    "INSERT OR IGNORE INTO issues(repo, user, timestamp, url) VALUES (?, ?, ?, ?)",
-                    issues_df[["repo", "user", "timestamp", "url"]].itertuples(
-                        index=False, name=None
-                    ),
-                )
-                logging.info(f"→ Migrados {len(issues_df)} issues")
-        except Exception as e:
-            logging.error(f"Error migrando issues: {e}")
-    conn.commit()
+
     conn.close()
 
 
-def add_new_users(users: List[str]):
+def add_new_users(users: List[(int, str)]):
     """Añade nuevos usuarios a la base de datos"""
     if not users:
         return
@@ -506,8 +317,8 @@ def add_new_users(users: List[str]):
     conn = get_db_conn()
     cur = conn.cursor()
     cur.executemany(
-        "INSERT OR IGNORE INTO users(user, processed, stars_count) VALUES (?, 0, 0)",
-        [(u,) for u in users],
+        "INSERT OR IGNORE INTO users(id_user, user, processed, stars_count) VALUES (?, ?, 0, 0)",
+        users,
     )
     conn.commit()
     conn.close()
@@ -517,8 +328,8 @@ def get_unprocessed_users_db(limit=MAX_USERS_TO_PROCESS):
     """Obtiene usuarios no procesados de la base de datos"""
     conn = get_db_conn()
     cur = conn.cursor()
-    cur.execute("SELECT user FROM users WHERE processed=0 LIMIT ?", (limit,))
-    users = [r[0] for r in cur.fetchall()]
+    cur.execute("SELECT user, id_user FROM users WHERE processed=0 LIMIT ?", (limit,))
+    users = [(r[0], r[1]) for r in cur.fetchall()]
     conn.close()
     return users
 
@@ -531,18 +342,21 @@ def add_new_repos(repos: List[dict]):
     conn = get_db_conn()
     cur = conn.cursor()
     cur.executemany(
-        """INSERT OR IGNORE INTO repos(repo, owner, processed, created_at, updated_at)
-           VALUES (?, ?, 0, ?, ?)""",
-        [(r["repo"], r["owner"], r["created_at"], r["updated_at"]) for r in repos],
+        """INSERT OR IGNORE INTO repos(id_repo, repo, owner, processed, created_at, updated_at)
+           VALUES (?, ?, ?, 0, ?, ?)""",
+        [
+            (r["id_repo"], r["repo"], r["owner"], r["created_at"], r["updated_at"])
+            for r in repos
+        ],
     )
     conn.commit()
     conn.close()
 
 
-def mark_repo_as_processed_db(repo_key: str):
+def mark_repo_as_processed_db(repo_key: int):
     """Marca un repositorio como procesado en la base de datos"""
     conn = get_db_conn()
-    conn.execute("UPDATE repos SET processed=1 WHERE repo=?", (repo_key,))
+    conn.execute("UPDATE repos SET processed=1 WHERE id_repo=?", (repo_key,))
     conn.commit()
     conn.close()
 
@@ -551,22 +365,26 @@ def get_unprocessed_repos_db(limit=100):
     """Obtiene repositorios no procesados de la base de datos"""
     conn = get_db_conn()
     cur = conn.cursor()
-    cur.execute("SELECT repo FROM repos WHERE processed=0 LIMIT ?", (limit,))
+    cur.execute(
+        "SELECT repo, id_repo, id_owner FROM repos WHERE processed=0 LIMIT ?", (limit,)
+    )
     repos = cur.fetchall()
     conn.close()
-    repos = [r[0] for r in repos]
+    repos = [(r[0], r[1], r[2]) for r in repos]
     return repos
 
 
-def add_user_stars_count(user: str, stars_count: int):
+def add_user_stars_count(id_user: int, stars_count: int):
     """Actualiza el conteo de estrellas de un usuario"""
     conn = get_db_conn()
-    conn.execute("UPDATE users SET stars_count=? WHERE user=?", (stars_count, user))
+    conn.execute(
+        "UPDATE users SET stars_count=? WHERE id_user=?", (stars_count, id_user)
+    )
     conn.commit()
     conn.close()
 
 
-def update_processed_users(users: List[str]):
+def update_processed_users(users: List[int]):
     """Marca usuarios como procesados"""
     if not users:
         return
@@ -574,7 +392,7 @@ def update_processed_users(users: List[str]):
     conn = get_db_conn()
     cur = conn.cursor()
     cur.executemany(
-        "UPDATE users SET processed=1 WHERE user=?",
+        "UPDATE users SET processed=1 WHERE id_user=?",
         [(u,) for u in users],
     )
     conn.commit()
@@ -587,9 +405,9 @@ def update_users_from_stargazers_db():
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT OR IGNORE INTO users(user, processed, stars_count)
-        SELECT DISTINCT user, 0, 0 FROM stargazers
-        WHERE user NOT IN (SELECT user FROM users)
+        INSERT OR IGNORE INTO users(id_user, user, processed, stars_count)
+        SELECT DISTINCT id_user, NULL, 0, 0 FROM stargazers
+        WHERE id_user NOT IN (SELECT id_user FROM users)
         """
     )
     new_users_count = cur.rowcount
@@ -599,11 +417,11 @@ def update_users_from_stargazers_db():
         logging.info(f"🆕 Agregados {new_users_count} nuevos usuarios desde stargazers")
 
 
-def is_repo_processed(repo_key: str) -> bool:
+def is_repo_processed(id_repo: int) -> bool:
     """Verifica si un repositorio ya ha sido procesado"""
     conn = get_db_conn()
     cur = conn.cursor()
-    cur.execute("SELECT processed FROM repos WHERE repo=?", (repo_key,))
+    cur.execute("SELECT processed FROM repos WHERE id_repo=?", (id_repo,))
     row = cur.fetchone()
     conn.close()
     return row is not None and row[0] == 1
@@ -839,7 +657,7 @@ async def get_repos_by_topic_async(
 async def fetch_repo_endpoint(
     session: aiohttp.ClientSession,
     endpoint_url: str,
-    repo_key: str,
+    id_repo: int,
     endpoint_name: str,
     max_items: int = MAX_ITEMS_PER_ENDPOINT,
 ) -> List[Dict]:
@@ -852,25 +670,29 @@ async def fetch_repo_endpoint(
                 if endpoint_name == "stargazers":
                     data.append(
                         {
-                            "repo": repo_key,
-                            "user": item["user"]["login"],
+                            "id_repo": id_repo,
+                            "id_user": item["user"]["id"],
                             "timestamp": item.get("starred_at", ""),
                         }
                     )
                 elif endpoint_name == "contributors":
                     data.append(
                         {
-                            "repo": repo_key,
-                            "user": item["login"],
+                            "id_repo": id_repo,
+                            "id_user": item["id"],
                             "commits": item.get("contributions", 0),
                         }
                     )
                 elif endpoint_name == "forks":
                     data.append(
                         {
-                            "repo": repo_key,
-                            "user": item["owner"]["login"],
-                            "timestamp": item.get("created_at", ""),
+                            "id_repo": id_repo,
+                            "id_user": item["owner"]["id"],
+                            "timestamp": int(
+                                datetime.strptime(
+                                    item.get("created_at", ""), "%Y-%m-%dT%H:%M:%SZ"
+                                ).timestamp()
+                            ),
                             "name": item.get("full_name", ""),
                             "url": item.get("html_url", ""),
                         }
@@ -879,9 +701,13 @@ async def fetch_repo_endpoint(
                     if "pull_request" not in item:  # Filtrar PRs
                         data.append(
                             {
-                                "repo": repo_key,
-                                "user": item["user"]["login"],
-                                "timestamp": item.get("created_at", ""),
+                                "id_repo": id_repo,
+                                "id_user": item["user"]["id"],
+                                "timestamp": int(
+                                    datetime.strptime(
+                                        item.get("created_at", ""), "%Y-%m-%dT%H:%M:%SZ"
+                                    ).timestamp()
+                                ),
                                 "url": item.get("html_url", ""),
                             }
                         )
@@ -902,28 +728,36 @@ async def fetch_repo_endpoint(
     if data:
         save_data_batch(data, endpoint_name)
         stats[f"{endpoint_name}_fetched"] += len(data)
-
+    stats["repos_processed"] += 1
+    mark_repo_as_processed_db(id_repo)
     return []  # Retornamos lista vacía ya que guardamos directamente
 
 
 async def get_repo_data_async(
-    session: aiohttp.ClientSession, owner: str, repo: str
+    session: aiohttp.ClientSession,
+    id_repo: int,
+    id_owner: int,
+    owner_name: str,
+    repo: str,
 ) -> Tuple[Optional[Dict], List, List, List, List]:
     """Versión asíncrona optimizada de get_repo_data"""
     global stats
-    repo_key = f"{owner}/{repo}"
+    repo_key = f"{owner_name}/{repo}"
     stats["last_repo"] = repo_key
 
     logging.info(f"🔍 Procesando {repo_key} (async)...")
 
     # Obtener información básica del repositorio
-    repo_json = await github_request_async(session, f"{BASE_URL}/repos/{owner}/{repo}")
+    repo_json = await github_request_async(
+        session, f"{BASE_URL}/repos/{owner_name}/{repo}"
+    )
     if not repo_json:
         return None, [], [], [], []
 
     repo_info = {
+        "id_repo": id_repo,
         "repo": repo_key,
-        "owner": owner,
+        "id_owner": id_owner,
         "is_fork": repo_json.get("fork", False),
         "stars": repo_json.get("stargazers_count", 0),
         "forks": repo_json.get("forks_count", 0),
@@ -934,8 +768,16 @@ async def get_repo_data_async(
         "has_wiki": repo_json.get("has_wiki", False),
         "has_pages": repo_json.get("has_pages", False),
         "has_downloads": repo_json.get("has_downloads", False),
-        "created_at": repo_json.get("created_at", ""),
-        "updated_at": repo_json.get("updated_at", ""),
+        "created_at": int(
+            datetime.strptime(
+                repo_json.get("created_at", ""), "%Y-%m-%dT%H:%M:%SZ"
+            ).timestamp()
+        ),
+        "updated_at": int(
+            datetime.strptime(
+                repo_json.get("updated_at", ""), "%Y-%m-%dT%H:%M:%SZ"
+            ).timestamp()
+        ),
         "topics": ",".join(repo_json.get("topics", [])),
         "processed": False,
     }
@@ -954,7 +796,7 @@ async def get_repo_data_async(
     )
 
     tasks = [
-        fetch_repo_endpoint(session, endpoint_url, repo_key, endpoint_name)
+        fetch_repo_endpoint(session, endpoint_url, id_repo, endpoint_name)
         for endpoint_url, endpoint_name in endpoints
     ]
 
@@ -968,8 +810,6 @@ async def get_repo_data_async(
             logging.error(f"❌ Error en endpoint {endpoint_name} para {repo_key}\n")
             # f"{''.join(traceback.format_exception(type(result), result, result.__traceback__))}"
 
-    stats["repos_processed"] += 1
-    mark_repo_as_processed_db(repo_key)
     logging.info(
         f"✅ {repo_key} completado (async) - ({stats['repos_processed']} repos totales)"
     )
@@ -1001,7 +841,9 @@ async def process_users_cycle_async(session: aiohttp.ClientSession):
     logging.info(f"👤 Procesando {len(unprocessed_users)} usuarios...")
 
     # Procesar usuarios concurrentemente
-    async def process_single_user(user: str) -> Tuple[str, List[Dict], int]:
+    async def process_single_user(
+        user: str, id_user: int
+    ) -> Tuple[str, List[Dict], int]:
         """Procesa un usuario individual de forma asíncrona"""
         logging.info(f"👤 Procesando usuario: {user}")
 
@@ -1023,8 +865,9 @@ async def process_users_cycle_async(session: aiohttp.ClientSession):
                     repo_key = starred_repo["full_name"]
 
                     new_repo_info = {
+                        "id_repo": starred_repo["id"],
                         "repo": repo_key,
-                        "owner": starred_repo["owner"]["login"],
+                        "id_owner": starred_repo["owner"]["id"],
                         "is_fork": starred_repo.get("fork", False),
                         "stars": starred_repo.get("stargazers_count", 0),
                         "forks": starred_repo.get("forks_count", 0),
@@ -1035,17 +878,30 @@ async def process_users_cycle_async(session: aiohttp.ClientSession):
                         "has_wiki": starred_repo.get("has_wiki", False),
                         "has_pages": starred_repo.get("has_pages", False),
                         "has_downloads": starred_repo.get("has_downloads", False),
-                        "created_at": starred_repo.get("created_at", ""),
-                        "updated_at": starred_repo.get("updated_at", ""),
+                        "created_at": int(
+                            datetime.strptime(
+                                starred_repo.get("created_at", ""), "%Y-%m-%dT%H:%M:%SZ"
+                            ).timestamp()
+                        ),
+                        "updated_at": int(
+                            datetime.strptime(
+                                starred_repo.get("updated_at", ""), "%Y-%m-%dT%H:%M:%SZ"
+                            ).timestamp()
+                        ),
                         "topics": ",".join(starred_repo.get("topics", [])),
                         "processed": False,
                     }
+
                     new_repos.append(new_repo_info)
                     starred_repos.append(
                         {
-                            "repo": repo_key,
-                            "user": user,
-                            "timestamp": item.get("starred_at", ""),
+                            "id_repo": starred_repo["id"],
+                            "id_user": id_user,
+                            "timestamp": int(
+                                datetime.strptime(
+                                    item.get("starred_at", ""), "%Y-%m-%dT%H:%M:%SZ"
+                                ).timestamp()
+                            ),
                         }
                     )
 
@@ -1059,11 +915,13 @@ async def process_users_cycle_async(session: aiohttp.ClientSession):
         SEMAPHORE_USER_LIMIT
     )  # Límite más conservador para usuarios
 
-    async def bounded_process_user(user: str):
+    async def bounded_process_user(user: str, id_user: int):
         async with semaphore:
-            return await process_single_user(user)
+            return await process_single_user(user, id_user)
 
-    user_tasks = [bounded_process_user(user) for user in unprocessed_users]
+    user_tasks = [
+        bounded_process_user(user, id_user) for (user, id_user) in unprocessed_users
+    ]
     user_results = await asyncio.gather(*user_tasks, return_exceptions=True)
 
     # Procesar resultados
@@ -1110,33 +968,36 @@ def should_process_users():
 
 async def process_repos_concurrently(
     session: aiohttp.ClientSession,
-    repos_to_process: List[str],
+    repos_to_process: List[(str, int, int)],
 ):
     """Procesa múltiples repositorios concurrentemente"""
 
-    async def process_single_repo(repo_key: str):
-        repo_parts = repo_key.split("/")
+    async def process_single_repo(repo_full_name: str, id_repo: int, id_owner: int):
+        repo_parts = repo_full_name.split("/")
         owner = repo_parts[0]
         name = repo_parts[1]
-        if is_repo_processed(repo_key):
-            logging.info(f"ℹ️ {repo_key} ya procesado, saltando...")
+        if is_repo_processed(repo_full_name):
+            logging.info(f"ℹ️ {repo_full_name} ya procesado, saltando...")
             return True
         try:
-            await get_repo_data_async(session, owner, name)
+            await get_repo_data_async(session, id_repo, id_owner, owner, name)
             update_status()
             return True
         except Exception as e:
-            logging.error(f"❌ Error procesando repo {repo_key}: {e}")
+            logging.error(f"❌ Error procesando repo {repo_full_name}: {e}")
             return False
 
     # Procesar repos en lotes concurrentes
     semaphore_repo = asyncio.Semaphore(SEMAPHORE_REPO_LIMIT)
 
-    async def bounded_process(name: str):
+    async def bounded_process(name: str, id_repo: int, id_owner: int):
         async with semaphore_repo:
-            return await process_single_repo(name)
+            return await process_single_repo(name, id_repo, id_owner)
 
-    tasks = [bounded_process(name) for name in repos_to_process]
+    tasks = [
+        bounded_process(repo, id_repo, id_owner)
+        for (repo, id_repo, id_owner) in repos_to_process
+    ]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     successful = sum(1 for r in results if r is True)
@@ -1237,11 +1098,11 @@ async def main():
                     for r in repos:
                         owner, name = r["owner"]["login"], r["name"]
                         name = f"{owner}/{name}"
+                        new_repos.append((name, r["id"], r["owner"]["id"]))
                         r["repo"] = name
                         r["owner"] = owner
                         r["created_at"] = r.get("created_at", "")
                         r["updated_at"] = r.get("updated_at", "")
-                        new_repos.append(name)
 
                     # Procesar nuevos repos concurrentemente
                     if new_repos:
