@@ -85,6 +85,8 @@ if not stats:
         "last_repo": "",
         "errors": 0,
         "rate_limits": 0,
+        "repos_fetched": 0,
+        "all_repos_processed": 0,
         "stargazers_fetched": 0,
         "contributors_fetched": 0,
         "forks_fetched": 0,
@@ -395,10 +397,13 @@ def load_stats_from_db():
 
     # Cargar conteos
     cur.execute("SELECT COUNT(*) FROM repos WHERE processed=1")
-    stats["repos_processed"] = cur.fetchone()[0]
+    stats["all_repos_processed"] = cur.fetchone()[0]
 
     cur.execute("SELECT COUNT(*) FROM users WHERE processed=1")
     stats["users_processed"] = cur.fetchone()[0]
+
+    cur.execute("SELECT COUNT(*) FROM repos")
+    stats["repos_fetched"] = cur.fetchone()[0]
 
     conn.close()
     logging.info(
@@ -508,9 +513,7 @@ async def get_paginated_async(
 
     while current_url and (max_items is None or items_fetched < max_items):
         page_params = params.copy()
-        page_params["per_page"] = min(
-            100, max_items - items_fetched if max_items else 100
-        )
+        page_params["per_page"] = 100
 
         # Reintentos para la página actual
         for attempt in range(MAX_RETRIES):

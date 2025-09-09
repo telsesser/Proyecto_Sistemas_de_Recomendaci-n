@@ -100,7 +100,6 @@ def show_status():
         print(f"📈 Repos/hora:        {status.get('avg_repos_per_hour', 0):.1f}")
         print(f"📈 Calls/minuto:      {status.get('avg_api_calls_per_minute', 0):.1f}")
         print(f"🎯 Último repo:       {status.get('last_repo', 'N/A')}")
-        print(f"👤 Usuarios procesados: {status.get('users_processed', 0):,}")
         print(
             f"⏳ Último procesamiento: {status.get('last_user_processing', 0):.1f} segundos"
         )
@@ -114,6 +113,9 @@ def show_status():
         print(f"👥 Contributors:     {status.get('contributors_fetched', 0):,}")
         print(f"🍴 Forks:            {status.get('forks_fetched', 0):,}")
         print(f"🐞 Issues:           {status.get('issues_fetched', 0):,}")
+        print(f"📦 Repos totales:    {status.get('repos_fetched', 0):,}")
+        print(f"✅ Repos procesados: {status.get('all_repos_processed', 0):,}")
+        print(f"👤 Usuarios procesados: {status.get('users_processed', 0):,}")
         print()
 
     # Archivos
