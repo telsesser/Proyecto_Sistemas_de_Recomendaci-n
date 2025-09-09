@@ -44,7 +44,7 @@ BACKUP_TIMEOUT = 3600  # 1 hora
 
 # CONFIGURACIÓN ASÍNCRONA
 MAX_CONCURRENT_REQUESTS = 2  # Reducido para evitar rate limiting
-SEMAPHORE_LIMIT = 1  # Reducido para mayor estabilidad
+SEMAPHORE_LIMIT = 2  # Reducido para mayor estabilidad
 REQUEST_DELAY = 0.5  # Aumentado para evitar rate limiting
 
 # Configuración de logging
@@ -454,40 +454,43 @@ async def get_paginated_async(
         # Reintentos para la página actual
         for attempt in range(MAX_RETRIES):
             try:
-                async with session.get(current_url, params=page_params) as resp:
-                    stats["api_calls"] += 1
+                async with request_semaphore:
+                    async with session.get(current_url, params=page_params) as resp:
+                        stats["api_calls"] += 1
 
-                    # Manejar rate limiting
-                    rate_limited = await handle_rate_limit(resp.headers)
-                    if rate_limited:
-                        continue  # Salir del bucle de reintentos, continuar con siguiente página
+                        # Manejar rate limiting
+                        rate_limited = await handle_rate_limit(resp.headers)
+                        if rate_limited:
+                            continue  # Salir del bucle de reintentos, continuar con siguiente página
 
-                    batch = await resp.json()
+                        batch = await resp.json()
 
-                    # Limitar items si se especifica max_items
-                    if max_items and items_fetched + len(batch) > max_items:
-                        batch = batch[: max_items - items_fetched]
+                        # Limitar items si se especifica max_items
+                        if max_items and items_fetched + len(batch) > max_items:
+                            batch = batch[: max_items - items_fetched]
 
-                    items_fetched += len(batch)
-                    yield batch
+                        items_fetched += len(batch)
+                        yield batch
 
-                    if not batch or (max_items and items_fetched >= max_items):
-                        return  # Terminar completamente
+                        if not batch or (max_items and items_fetched >= max_items):
+                            return  # Terminar completamente
 
-                    # Usar Link header para siguiente página
-                    links = resp.headers.get("Link", "")
-                    current_url = None
-                    for part in links.split(","):
-                        if 'rel="next"' in part:
-                            current_url = part[part.find("<") + 1 : part.find(">")]
+                        # Usar Link header para siguiente página
+                        links = resp.headers.get("Link", "")
+                        current_url = None
+                        for part in links.split(","):
+                            if 'rel="next"' in part:
+                                current_url = part[part.find("<") + 1 : part.find(">")]
 
-                    page += 1
+                        page += 1
 
-                    # Seguridad: evitar bucles infinitos
-                    if page > 5000:
-                        logging.warning(f"⚠️ Alcanzado límite de páginas, deteniendo...")
-                        return
-                    break  # Éxito, salir del bucle de reintentos
+                        # Seguridad: evitar bucles infinitos
+                        if page > 5000:
+                            logging.warning(
+                                f"⚠️ Alcanzado límite de páginas, deteniendo..."
+                            )
+                            return
+                        break  # Éxito, salir del bucle de reintentos
 
             except Exception as e:
                 if attempt == MAX_RETRIES - 1:  # Último intento
@@ -837,10 +840,10 @@ async def process_repos_concurrently(
             return False
 
     # Procesar repos en lotes concurrentes
-    semaphore = asyncio.Semaphore(SEMAPHORE_LIMIT)
+    semaphore_repo = asyncio.Semaphore(SEMAPHORE_LIMIT)
 
     async def bounded_process(name: str):
-        async with semaphore:
+        async with semaphore_repo:
             return await process_single_repo(name)
 
     tasks = [bounded_process(name) for name in repos_to_process]
