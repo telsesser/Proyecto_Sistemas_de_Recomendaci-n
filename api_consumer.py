@@ -35,14 +35,14 @@ FORCE_GC_EVERY = 3  # Forzar garbage collection cada N repos
 
 # Tiempo para procesar usuarios (en segundos)
 USER_PROCESSING_INTERVAL = 360
-MAX_USERS_TO_PROCESS = 1  # Máximo usuarios a procesar por ciclo
+MAX_USERS_TO_PROCESS = 3  # Máximo usuarios a procesar por ciclo
 
 # Tiempo de espera para copias de seguridad (en segundos)
 BACKUP_TIMEOUT = 3600  # 1 hora
 
 # CONFIGURACIÓN ASÍNCRONA
 MAX_CONCURRENT_REQUESTS = 5  # Reducido para evitar rate limiting
-SEMAPHORE_LIMIT = 5  # Reducido para mayor estabilidad
+SEMAPHORE_LIMIT = 3  # Reducido para mayor estabilidad
 REQUEST_DELAY = 0.5  # Aumentado para evitar rate limiting
 
 # Configuración de logging
@@ -860,7 +860,7 @@ async def main():
     last_progress_log = time.time()
 
     # Configurar sesión HTTP asíncrona con timeouts más generosos
-    timeout = aiohttp.ClientTimeout(total=60, connect=15)
+    timeout = aiohttp.ClientTimeout(total=60, connect=60)
     connector = aiohttp.TCPConnector(
         limit=MAX_CONCURRENT_REQUESTS,
         limit_per_host=SEMAPHORE_LIMIT,
