@@ -429,20 +429,19 @@ async def github_request_async(
         return None
 
 
+MAX_RETRIES = 3
+
+
 async def get_paginated_async(
     session: aiohttp.ClientSession,
     url: str,
-    params: Optional[Dict] = None,
+    params: Optional[Dict] = {},
     max_items: Optional[int] = None,
 ) -> AsyncGenerator[List[Dict], None]:
     """Generador asíncrono para paginación mejorado"""
-    page = 1
-    items_fetched = 0
-
-    if not params:
-        params = {}
-
     current_url = url
+    items_fetched = 0
+    page = 1
 
     while current_url and (max_items is None or items_fetched < max_items):
         page_params = params.copy()
@@ -450,41 +449,56 @@ async def get_paginated_async(
             100, max_items - items_fetched if max_items else 100
         )
 
-        logging.info(f"[Paginación] Página {page} - URL: {current_url}")
+        # Reintentos para la página actual
+        for attempt in range(MAX_RETRIES):
+            try:
+                async with session.get(current_url, params=page_params) as resp:
+                    stats["api_calls"] += 1
 
-        async with session.get(current_url, params=page_params) as resp:
-            stats["api_calls"] += 1
+                    # Manejar rate limiting
+                    rate_limited = await handle_rate_limit(resp.headers)
+                    if rate_limited:
+                        continue  # Salir del bucle de reintentos, continuar con siguiente página
 
-            # Manejar rate limiting
-            rate_limited = await handle_rate_limit(resp.headers)
-            if rate_limited:
-                continue  # Reintentar la misma página
+                    batch = await resp.json()
 
-            batch = await resp.json()
+                    # Limitar items si se especifica max_items
+                    if max_items and items_fetched + len(batch) > max_items:
+                        batch = batch[: max_items - items_fetched]
 
-            # Limitar items si se especifica max_items
-            if max_items and items_fetched + len(batch) > max_items:
-                batch = batch[: max_items - items_fetched]
+                    items_fetched += len(batch)
+                    yield batch
 
-            items_fetched += len(batch)
-            yield batch
+                    if not batch or (max_items and items_fetched >= max_items):
+                        return  # Terminar completamente
 
-            if not batch or (max_items and items_fetched >= max_items):
-                break
+                    # Usar Link header para siguiente página
+                    links = resp.headers.get("Link", "")
+                    current_url = None
+                    for part in links.split(","):
+                        if 'rel="next"' in part:
+                            current_url = part[part.find("<") + 1 : part.find(">")]
 
-            # Usar Link header para siguiente página
-            links = resp.headers.get("Link", "")
-            current_url = None
-            for part in links.split(","):
-                if 'rel="next"' in part:
-                    current_url = part[part.find("<") + 1 : part.find(">")]
+                    page += 1
 
-            page += 1
+                    # Seguridad: evitar bucles infinitos
+                    if page > 5000:
+                        logging.warning(f"⚠️ Alcanzado límite de páginas, deteniendo...")
+                        return
 
-            # Seguridad: evitar bucles infinitos
-            if page > 5000:
-                logging.warning(f"⚠️ Alcanzado límite de páginas, deteniendo...")
-                break
+                    break  # Éxito, salir del bucle de reintentos
+
+            except Exception as e:
+                if attempt == MAX_RETRIES - 1:  # Último intento
+                    logging.error(
+                        f"❌ Página {page} falló después de {MAX_RETRIES} intentos: {str(e)}"
+                    )
+                    raise
+
+                logging.warning(
+                    f"⚠️ Página {page}, intento {attempt + 1} falló: {str(e)}. Reintentando..."
+                )
+                await asyncio.sleep(2**attempt)  # 1s, 2s, 4s
 
 
 def save_data_batch(data_list: List[Dict], file_path: str, columns=None):
