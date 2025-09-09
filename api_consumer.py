@@ -62,7 +62,8 @@ if os.path.exists(STATUS_FILE):
             stats["pages_processed"] = 0  # paginas de pantalla principal de github
             stats["pages_fetched"] = 0  # paginas de pagination
             stats["api_calls"] = 0
-
+            if stats["all_users"] is None:
+                stats["all_users"] = 0
             if stats.get("all_repos_processed") is None:
                 stats["all_repos_processed"] = 0
             if stats.get("repos_fetched") is None:
@@ -84,6 +85,7 @@ if not stats:
         "repos_processed": 0,
         "pages_processed": 0,
         "api_calls": 0,
+        "all_users": 0,
         "last_repo": "",
         "errors": 0,
         "rate_limits": 0,
@@ -158,6 +160,7 @@ def update_status():
         "issues_fetched": stats["issues_fetched"],
         "users_processed": stats["users_processed"],
         "last_user_processing": stats["last_user_processing"],
+        "all_users": stats["all_users"],
     }
 
     with open(STATUS_FILE, "w") as f:
@@ -494,6 +497,9 @@ def load_stats_from_db():
     cur.execute("SELECT COUNT(*) FROM issues")
     stats["issues_fetched"] = cur.fetchone()[0]
 
+    cur.execute("SELECT COUNT(*) FROM users")
+    stats["all_users"] = cur.fetchone()[0]
+
     conn.close()
     logging.info(
         f"Estadísticas cargadas desde DB: {stats['repos_processed']} repos, {stats['users_processed']} usuarios procesados"
@@ -745,6 +751,7 @@ async def fetch_repo_endpoint(
         save_data_batch(data, endpoint_name)
         stats[f"{endpoint_name}_fetched"] += len(data)
     stats["repos_processed"] += 1
+    stats["all_repos_processed"] += 1
     mark_repo_as_processed_db(id_repo)
     return []  # Retornamos lista vacía ya que guardamos directamente
 
