@@ -37,14 +37,14 @@ FORCE_GC_EVERY = 3  # Forzar garbage collection cada N repos
 
 # Tiempo para procesar usuarios (en segundos)
 USER_PROCESSING_INTERVAL = 360
-MAX_USERS_TO_PROCESS = 3  # Máximo usuarios a procesar por ciclo
+MAX_USERS_TO_PROCESS = 2  # Máximo usuarios a procesar por ciclo
 
 # Tiempo de espera para copias de seguridad (en segundos)
 BACKUP_TIMEOUT = 3600  # 1 hora
 
 # CONFIGURACIÓN ASÍNCRONA
-MAX_CONCURRENT_REQUESTS = 4  # Reducido para evitar rate limiting
-SEMAPHORE_LIMIT = 4  # Reducido para mayor estabilidad
+MAX_CONCURRENT_REQUESTS = 2  # Reducido para evitar rate limiting
+SEMAPHORE_LIMIT = 2  # Reducido para mayor estabilidad
 REQUEST_DELAY = 0.5  # Aumentado para evitar rate limiting
 
 # Configuración de logging
@@ -431,7 +431,7 @@ async def github_request_async(
         return None
 
 
-MAX_RETRIES = 3
+MAX_RETRIES = 5
 
 
 async def get_paginated_async(
@@ -492,7 +492,7 @@ async def get_paginated_async(
             except Exception as e:
                 if attempt == MAX_RETRIES - 1:  # Último intento
                     logging.error(
-                        f"❌ Página {page} falló después de {MAX_RETRIES} intentos:"
+                        f"❌ Pagina {page} fallo despues de {MAX_RETRIES} intentos:"
                     )
                     raise
                 await asyncio.sleep(2**attempt)  # 1s, 2s, 4s
@@ -684,10 +684,8 @@ async def get_repo_data_async(
     for i, result in enumerate(results):
         if isinstance(result, Exception):
             endpoint_name = endpoints[i][1]
-            logging.error(
-                f"❌ Error en endpoint {endpoint_name} para {repo_key}\n"
-                f"{''.join(traceback.format_exception(type(result), result, result.__traceback__))}"
-            )
+            logging.error(f"❌ Error en endpoint {endpoint_name} para {repo_key}\n")
+            # f"{''.join(traceback.format_exception(type(result), result, result.__traceback__))}"
 
     stats["repos_processed"] += 1
     logging.info(
@@ -876,7 +874,8 @@ async def main():
 
     # Configurar sesión HTTP asíncrona con timeouts más generosos
     timeout = aiohttp.ClientTimeout(
-        total=60,  # tiempo máximo total para la request
+        total=30,  # tiempo máximo total para la request
+        connect=10,  # tiempo para establecer conexión
         sock_connect=30,  # tiempo para conectar
         sock_read=30,  # tiempo para leer la respuesta
     )
@@ -885,6 +884,9 @@ async def main():
         limit_per_host=SEMAPHORE_LIMIT,
         ttl_dns_cache=300,
         use_dns_cache=True,
+        keepalive_timeout=30,  # Timeout de keep-alive
+        enable_cleanup_closed=True,  # Limpiar conexiones cerradas
+        ssl=False,  # Deshabilitar SSL para evitar problemas
     )
 
     try:
