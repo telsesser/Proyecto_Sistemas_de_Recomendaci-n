@@ -41,8 +41,8 @@ MAX_USERS_TO_PROCESS = 3  # Máximo usuarios a procesar por ciclo
 BACKUP_TIMEOUT = 3600  # 1 hora
 
 # CONFIGURACIÓN ASÍNCRONA
-MAX_CONCURRENT_REQUESTS = 5  # Reducido para evitar rate limiting
-SEMAPHORE_LIMIT = 3  # Reducido para mayor estabilidad
+MAX_CONCURRENT_REQUESTS = 4  # Reducido para evitar rate limiting
+SEMAPHORE_LIMIT = 2  # Reducido para mayor estabilidad
 REQUEST_DELAY = 0.5  # Aumentado para evitar rate limiting
 
 # Configuración de logging
