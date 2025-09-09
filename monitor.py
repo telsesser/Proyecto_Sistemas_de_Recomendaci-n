@@ -113,6 +113,7 @@ def show_status():
         print(f"🐞 Issues:           {status.get('issues_fetched', 0):,}")
         print(f"📦 Repos totales:    {status.get('repos_fetched', 0):,}")
         print(f"✅ Repos procesados: {status.get('all_repos_processed', 0):,}")
+        print(f"👤 Usuarios Totales: {status.get('all_users', 0):,}")
         print(f"👤 Usuarios procesados: {status.get('users_processed', 0):,}")
         print()
 
