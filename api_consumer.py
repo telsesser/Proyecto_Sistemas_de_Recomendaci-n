@@ -879,7 +879,7 @@ async def get_repo_data_async(
         "topics": ",".join(repo_json.get("topics", [])),
         "processed": False,
     }
-    update_repo(repo_info, "repos")
+    update_repo(repo_info)
     # Crear tareas concurrentes para todos los endpoints
     endpoints = [
         (f"{BASE_URL}/repos/{repo_key}/stargazers", "stargazers"),
