@@ -37,10 +37,10 @@ BACKUP_TIMEOUT = 3600  # 1 hora
 # CONFIGURACIÓN ASÍNCRONA
 MAX_CONCURRENT_REQUESTS = 4  # Máximo requests concurrentes
 SEMAPHORE_LIMIT = 2  # limite de conexiones simultaneas a la API
-REPOS_BATCH_SIZE = 4  # Número de repos a procesar en paralelo
-SEMAPHORE_REPO_LIMIT = 2  # Límite DE procesamiento de repositorios en simultáneo
+UNPROCESSED_REPOS_TO_PROCESS = 120  # Número de repositorios pendientes para procesar
+REPOS_BATCH_SIZE = 6  # Número de repos a procesar en paralelo
+SEMAPHORE_REPO_LIMIT = 3  # Límite DE procesamiento de repos en simultáneo
 SEMAPHORE_USER_LIMIT = 2  # Límite de procesamiento de usuarios en simultáneo
-
 REQUEST_DELAY = 0.5  # Aumentado para evitar rate limiting
 
 # Configuración de logging
@@ -1085,7 +1085,9 @@ async def main():
                         await process_users_cycle_async(session)
 
                     # Procesar repositorios no procesados primero (usar BD si está disponible)
-                    unprocessed_repos = get_unprocessed_repos_db(2)
+                    unprocessed_repos = get_unprocessed_repos_db(
+                        UNPROCESSED_REPOS_TO_PROCESS
+                    )
 
                     if unprocessed_repos:
                         logging.info(
