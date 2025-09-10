@@ -355,6 +355,14 @@ def mark_repo_as_processed_db(repo_key: int):
     conn.close()
 
 
+def mark_repo_as_error_db(repo_key: int):
+    """Marca un repositorio como procesado en la base de datos"""
+    conn = get_db_conn()
+    conn.execute("UPDATE repos SET processed=-1 WHERE id_repo=?", (repo_key,))
+    conn.commit()
+    conn.close()
+
+
 def get_unprocessed_repos_db(limit=100):
     """Obtiene repositorios no procesados de la base de datos"""
     conn = get_db_conn()
@@ -765,7 +773,8 @@ async def get_repo_data_async(
         session, f"{BASE_URL}/repos/{owner_name}/{repo}"
     )
     if not repo_json:
-        return None, [], [], [], []
+        mark_repo_as_error_db(id_repo)
+        raise ValueError("No se pudo obtener información del repositorio")
 
     repo_info = {
         "id_repo": id_repo,
@@ -880,7 +889,7 @@ async def process_users_cycle_async(session: aiohttp.ClientSession):
             ):
                 if not batch:
                     continue
-
+                logging.info(f"url: {BASE_URL}/users/{user}/starred")
                 for item in batch:
                     user_starred_count += 1
                     starred_repo = item["repo"]
