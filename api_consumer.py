@@ -434,6 +434,29 @@ def update_user_name(id_user: int, user_name: str):
     conn.close()
 
 
+def update_repo(repo: Dict):
+    """Actualiza el repositorio en la base de datos"""
+    conn = get_db_conn()
+    conn.execute(
+        "UPDATE repos SET stars=?, forks=?, watchers=?, open_issues=?, has_issues=?, has_projects=?, has_wiki=?, has_pages=?, has_downloads=?, topics=? WHERE id_repo=?",
+        (
+            repo["stars"],
+            repo["forks"],
+            repo["watchers"],
+            repo["open_issues"],
+            repo["has_issues"],
+            repo["has_projects"],
+            repo["has_wiki"],
+            repo["has_pages"],
+            repo["has_downloads"],
+            repo["topics"],
+            repo["id_repo"],
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
 def update_users(table_name: str):
     """Añade nuevos usuarios desde la tabla"""
     conn = get_db_conn()
@@ -856,7 +879,7 @@ async def get_repo_data_async(
         "topics": ",".join(repo_json.get("topics", [])),
         "processed": False,
     }
-    save_data_batch([repo_info], "repos")
+    update_repo(repo_info, "repos")
     # Crear tareas concurrentes para todos los endpoints
     endpoints = [
         (f"{BASE_URL}/repos/{repo_key}/stargazers", "stargazers"),
