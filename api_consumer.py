@@ -23,6 +23,7 @@ DEBUG = os.getenv("DEBUG", "False").lower() in ("true", "1", "t")
 START_DATE = os.getenv("START_DATE", "2025-01-01")
 
 # Configuración para prevenir memory leaks
+
 MAX_ITEMS_PER_ENDPOINT = 3000  # Límite máximo por endpoint
 BATCH_SIZE = 100  # Procesar en lotes
 FORCE_GC_EVERY = 3  # Forzar garbage collection cada N repos
@@ -42,6 +43,8 @@ REPOS_BATCH_SIZE = 6  # Número de repos a procesar en paralelo
 SEMAPHORE_REPO_LIMIT = 3  # Límite DE procesamiento de repos en simultáneo
 SEMAPHORE_USER_LIMIT = 2  # Límite de procesamiento de usuarios en simultáneo
 REQUEST_DELAY = 0.5  # Aumentado para evitar rate limiting
+
+MIN_STARS_TO_SCRAP_REPO = 1000
 
 # Configuración de logging
 DATA_DIR = "data"
@@ -387,16 +390,12 @@ def get_unprocessed_repos_db(limit=100):
     conn = get_db_conn()
     cur = conn.cursor()
     cur.execute(
-        "SELECT repo, id_repo, id_owner FROM repos WHERE processed=0 AND stars > 100 LIMIT ?",
+        f"SELECT repo, id_repo, id_owner FROM repos WHERE processed=0 AND stars > {MIN_STARS_TO_SCRAP_REPO} LIMIT ?",
         (limit,),
     )
     repos = cur.fetchall()
     if not repos:
-        cur.execute(
-            "SELECT repo, id_repo, id_owner FROM repos WHERE processed=0 LIMIT ?",
-            (limit,),
-        )
-        repos = cur.fetchall()
+        return []
     conn.close()
     repos = [(r[0], r[1], r[2]) for r in repos]
     return repos
@@ -435,14 +434,14 @@ def update_user_name(id_user: int, user_name: str):
     conn.close()
 
 
-def update_users_from_contributors_db():
-    """Añade nuevos usuarios desde la tabla de contributors"""
+def update_users(table_name: str):
+    """Añade nuevos usuarios desde la tabla"""
     conn = get_db_conn()
     cur = conn.cursor()
     cur.execute(
-        """
+        f"""
         INSERT OR IGNORE INTO users(id_user, user, processed, stars_count)
-        SELECT DISTINCT id_user, NULL, 0, 0 FROM contributors
+        SELECT DISTINCT id_user, NULL, 0, 0 FROM {table_name}
         WHERE id_user NOT IN (SELECT id_user FROM users)
         """
     )
@@ -906,7 +905,7 @@ async def process_users_cycle_async(session: aiohttp.ClientSession):
 
     logging.info("🔄 Iniciando ciclo de procesamiento de usuarios (async)...")
     # Añadir nuevos usuarios desde stargazers no procesados
-    update_users_from_contributors_db()
+    update_users(table_name="stargazers")
     # Obtener usuarios únicos no procesados de la base de datos
     unprocessed_users = get_unprocessed_users_db(MAX_USERS_TO_PROCESS)
 
@@ -1101,7 +1100,7 @@ async def main():
 
     # Inicializar base de datos
     init_db()
-    update_users_from_contributors_db()
+    update_users(table_name="stargazers")
     load_stats_from_db()
     update_status()
     if not os.path.exists(DATA_DIR):
