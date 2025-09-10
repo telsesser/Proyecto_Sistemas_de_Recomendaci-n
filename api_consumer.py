@@ -387,9 +387,16 @@ def get_unprocessed_repos_db(limit=100):
     conn = get_db_conn()
     cur = conn.cursor()
     cur.execute(
-        "SELECT repo, id_repo, id_owner FROM repos WHERE processed=0 LIMIT ?", (limit,)
+        "SELECT repo, id_repo, id_owner FROM repos WHERE processed=0 AND stars > 100 LIMIT ?",
+        (limit,),
     )
     repos = cur.fetchall()
+    if not repos:
+        cur.execute(
+            "SELECT repo, id_repo, id_owner FROM repos WHERE processed=0 LIMIT ?",
+            (limit,),
+        )
+        repos = cur.fetchall()
     conn.close()
     repos = [(r[0], r[1], r[2]) for r in repos]
     return repos
