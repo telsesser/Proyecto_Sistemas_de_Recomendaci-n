@@ -102,16 +102,34 @@ if DEBUG:
     logging.getLogger().setLevel(logging.DEBUG)
     logging.info("Modo DEBUG activado")
 
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN2")
-if not GITHUB_TOKEN:
-    raise ValueError("❌ No se encontró GITHUB_TOKEN2 en el .env")
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+GITHUB_TOKEN2 = os.getenv("GITHUB_TOKEN2")
 
-HEADERS = {
-    "Authorization": f"Bearer {GITHUB_TOKEN}",
-    "Accept": "application/vnd.github.v3.star+json",
-    "User-Agent": "GitHub-Scraper-AsyncIO/1.0",
+
+headers = {
+    "header1": {
+        "header": {
+            "Authorization": f"Bearer {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github.v3.star+json",
+            "User-Agent": "GitHub-Scraper-AsyncIO/1.0",
+        },
+        "rate_limit": 5000,
+        "reset_time": 0,
+    },
+    "header2": {
+        "header": {
+            "Authorization": f"Bearer {GITHUB_TOKEN2}",
+            "Accept": "application/vnd.github.v3.star+json",
+            "User-Agent": "GitHub-Scraper-AsyncIO/1.0",
+        },
+        "rate_limit": 5000,
+        "reset_time": 0,
+    },
 }
 BASE_URL = "https://api.github.com"
+
+if not GITHUB_TOKEN:
+    raise ValueError("❌ No se encontró GITHUB_TOKEN2 en el .env")
 
 # Semáforo global para controlar concurrencia
 request_semaphore = asyncio.Semaphore(SEMAPHORE_LIMIT)
@@ -134,7 +152,8 @@ def update_status():
         "api_calls": stats["api_calls"],
         "last_repo": stats["last_repo"],
         "errors": stats["errors"],
-        "rate_limits": stats["rate_limits"],
+        "rate_limits_header1": stats.get("rate_limits_header1"),
+        "rate_limits_header2": stats.get("rate_limits_header2"),
         "avg_repos_per_hour": (
             stats["repos_processed"] / (runtime / 3600) if runtime > 0 else 0
         ),
@@ -447,15 +466,18 @@ def there_are_unprocessed_users() -> bool:
     return row is not None
 
 
-async def handle_rate_limit(response_headers: dict) -> bool:
+async def handle_rate_limit(response_headers: dict, header) -> bool:
     """Maneja el rate limiting de forma centralizada"""
+    global headers
+    global stats
     remaining = response_headers.get("X-RateLimit-Remaining")
     reset = response_headers.get("X-RateLimit-Reset")
-
+    headers[header]["rate_limit"] = int(remaining)
+    headers[header]["reset_time"] = int(reset)
     if remaining:
-        stats["rate_limits"] = int(remaining)
-
-        if int(remaining) <= 5:
+        stats[f"rate_limits_{header}"] = int(remaining)
+        stats[f"reset_time_{header}"] = int(reset)
+        if int(remaining) <= 10:
             reset_time = int(reset) if reset else time.time() + 60
             sleep_time = max(reset_time - int(time.time()), 60)
             logging.warning(
@@ -466,6 +488,26 @@ async def handle_rate_limit(response_headers: dict) -> bool:
             return True  # Indica que se durmió
 
     return False  # No se durmió
+
+
+async def check_rate_limit():
+    global stats
+    global headers
+    header_max_rate_limit = max(headers, key=lambda k: headers[k]["rate_limit"] or 0)
+    header_min_reset_time = min(
+        headers, key=lambda k: headers[k]["reset_time"] or float("inf")
+    )
+    logging.info(
+        f" Headers max rate limit: {header_max_rate_limit}, min reset time: {header_min_reset_time}"
+    )
+    remaining = headers[header_max_rate_limit]["rate_limit"]
+    reset_time = headers[header_min_reset_time]["reset_time"]
+    if remaining <= 10 and reset_time:
+        sleep_time = max(reset_time - int(time.time()), 60)
+        logging.warning(f"💤 Rate limit bajo ({remaining}). Durmiendo {sleep_time}s...")
+        await asyncio.sleep(sleep_time)
+    logging.info(f"Header elejido {header_max_rate_limit}, ratelimit: {remaining}")
+    return header_max_rate_limit
 
 
 def load_stats_from_db():
@@ -513,17 +555,18 @@ async def github_request_async(
 ) -> Optional[Dict]:
     """Versión asíncrona de github_request con manejo mejorado de rate limiting"""
     global stats
-
+    global headers
     async with request_semaphore:
         stats["api_calls"] += 1
 
         for attempt in range(retries):
             try:
-                await asyncio.sleep(REQUEST_DELAY)  # Delay para evitar rate limiting
-
-                async with session.get(url, params=params) as resp:
+                h = await check_rate_limit()
+                async with session.get(
+                    url, headers=headers[h]["header"], params=params
+                ) as resp:
                     # Manejar rate limiting
-                    rate_limited = await handle_rate_limit(resp.headers)
+                    rate_limited = await handle_rate_limit(resp.headers, h)
                     if rate_limited:
                         continue  # Reintentar después del sleep
                     if resp.status == 200:
@@ -561,6 +604,7 @@ async def get_paginated_async(
     max_items: Optional[int] = None,
 ) -> AsyncGenerator[List[Dict], None]:
     """Generador asíncrono para paginación mejorado"""
+    global headers
     current_url = url
     items_fetched = 0
     page = 1
@@ -573,7 +617,10 @@ async def get_paginated_async(
         for attempt in range(MAX_RETRIES):
             try:
                 async with request_semaphore:
-                    async with session.get(current_url, params=page_params) as resp:
+                    h = await check_rate_limit()
+                    async with session.get(
+                        current_url, headers=headers[h]["header"], params=page_params
+                    ) as resp:
                         stats["api_calls"] += 1
                         text = await resp.text()
                 batch = orjson.loads(text)
@@ -602,7 +649,7 @@ async def get_paginated_async(
                 if page > 5000:
                     logging.warning(f"⚠️ Alcanzado límite de páginas, deteniendo...")
                     return
-                rate_limited = await handle_rate_limit(resp.headers)
+                rate_limited = await handle_rate_limit(resp.headers, h)
                 if rate_limited:
                     continue
                 break
@@ -1070,7 +1117,7 @@ async def main():
 
     try:
         async with aiohttp.ClientSession(
-            headers=HEADERS, timeout=timeout, connector=connector
+            timeout=timeout, connector=connector
         ) as session:
 
             while True:

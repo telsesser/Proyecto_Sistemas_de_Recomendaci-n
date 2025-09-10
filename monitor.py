@@ -91,7 +91,8 @@ def show_status():
         print(f"📄 Páginas:           {status.get('pages_fetched', 0):,}")
         print(f"🌐 API calls:         {status.get('api_calls', 0):,}")
         print(f"❌ Errores:           {status.get('errors', 0):,}")
-        print(f"⏸️ Rate limits:       {status.get('rate_limits', 0)}")
+        print(f"⏸️ Rate limits 1:       {status.get('rate_limits_header1', 0)}")
+        print(f"⏸️ Rate limits 2:       {status.get('rate_limits_header2', 0)}")
         print(f"📈 Repos/hora:        {status.get('avg_repos_per_hour', 0):.1f}")
         print(f"📈 Calls/minuto:      {status.get('avg_api_calls_per_minute', 0):.1f}")
         print(
