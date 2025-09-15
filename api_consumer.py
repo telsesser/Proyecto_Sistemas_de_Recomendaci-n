@@ -1153,7 +1153,8 @@ async def main():
                 try:
                     # Verificar si es tiempo de crear backup
                     if time.time() - stats["last_backup"] > BACKUP_TIMEOUT:
-                        backup_data_folder()
+                        ##backup_data_folder()
+                        pass
 
                     # Verificar si es tiempo de procesar usuarios
                     b = there_are_unprocessed_users()
