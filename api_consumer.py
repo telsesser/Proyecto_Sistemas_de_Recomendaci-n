@@ -716,7 +716,6 @@ def save_data_batch(data_list: List[Dict], table_name: str, columns=None):
 
         # Convertir data_list a tupla de valores en el orden de columns
         values = [tuple(item.get(col, None) for col in columns) for item in data_list]
-        print(f"Guardando {len(values)} registros en {table_name}... {insert_sql}")
 
         cur.executemany(insert_sql, values)
         conn.commit()
