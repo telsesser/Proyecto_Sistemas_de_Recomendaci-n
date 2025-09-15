@@ -927,7 +927,7 @@ async def process_users_cycle_async(session: aiohttp.ClientSession):
 
     logging.info("🔄 Iniciando ciclo de procesamiento de usuarios (async)...")
     # Añadir nuevos usuarios desde stargazers no procesados
-    update_users(table_name="stargazers")
+    ## update_users(table_name="stargazers")
     # Obtener usuarios únicos no procesados de la base de datos
     unprocessed_users = get_unprocessed_users_db(MAX_USERS_TO_PROCESS)
 
@@ -1030,7 +1030,7 @@ async def process_users_cycle_async(session: aiohttp.ClientSession):
 
     user_tasks = [bounded_process_user(id_user) for id_user in unprocessed_users]
     user_results = await asyncio.gather(*user_tasks, return_exceptions=True)
-
+    update_status()
     # Procesar resultados
     all_new_repos = []
     processed_users = []
@@ -1122,7 +1122,7 @@ async def main():
 
     # Inicializar base de datos
     init_db()
-    update_users(table_name="stargazers")
+    # update_users(table_name="stargazers")
     load_stats_from_db()
     update_status()
     if not os.path.exists(DATA_DIR):
