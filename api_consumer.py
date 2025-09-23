@@ -44,7 +44,8 @@ SEMAPHORE_REPO_LIMIT = 3  # Límite DE procesamiento de repos en simultáneo
 SEMAPHORE_USER_LIMIT = 2  # Límite de procesamiento de usuarios en simultáneo
 REQUEST_DELAY = 0.5  # Aumentado para evitar rate limiting
 
-MIN_STARS_TO_SCRAP_REPO = 1000
+MIN_STARS_TO_SCRAP_REPO = 10000
+
 
 # Configuración de logging
 DATA_DIR = "data"
@@ -387,17 +388,21 @@ def mark_repo_as_error_db(repo_key: int):
 
 def get_unprocessed_repos_db(limit=100):
     """Obtiene repositorios no procesados de la base de datos"""
-    conn = get_db_conn()
-    cur = conn.cursor()
-    cur.execute(
-        f"SELECT repo, id_repo, id_owner FROM repos WHERE processed=0 AND stars > {MIN_STARS_TO_SCRAP_REPO} LIMIT ?",
-        (limit,),
+    query = (
+        "SELECT repo, id_repo, id_owner "
+        "FROM repos WHERE processed=0 AND stars > ? LIMIT ?"
     )
-    repos = cur.fetchall()
-    if not repos:
-        return []
-    conn.close()
-    repos = [(r[0], r[1], r[2]) for r in repos]
+
+    stars_threshold = MIN_STARS_TO_SCRAP_REPO
+    repos = []
+
+    with get_db_conn() as conn:
+        cur = conn.cursor()
+        while stars_threshold > 0 and not repos:
+            cur.execute(query, (stars_threshold, limit))
+            repos = cur.fetchall()
+            stars_threshold //= 2  # reduce el umbral a la mitad en cada intento
+
     return repos
 
 
