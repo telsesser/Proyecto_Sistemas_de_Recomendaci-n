@@ -1023,6 +1023,7 @@ async def process_users_cycle_async(session: aiohttp.ClientSession):
                 f"❌ Error procesando usuarios: {e}",
                 f"{''.join(traceback.format_exception(type(e), e, e.__traceback__))}",
             )
+            return id_user, [], 0, []
 
     # Ejecutar procesamiento de usuarios con límite de concurrencia
     semaphore = asyncio.Semaphore(
@@ -1043,6 +1044,8 @@ async def process_users_cycle_async(session: aiohttp.ClientSession):
     for result in user_results:
         if isinstance(result, Exception):
             logging.error(f"❌ Error procesando usuario: {result}")
+            processed_users.append(id_user)
+
             continue
 
         id_user, new_repos, stars_count, starred_repos = result
