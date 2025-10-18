@@ -1167,6 +1167,7 @@ async def main():
                     b = there_are_unprocessed_users()
                     if b:
                         await process_users_cycle_async(session)
+                        continue  # Volver al inicio del loop para verificar más usuarios pendientes
 
                     # Procesar repositorios no procesados primero (usar BD si está disponible)
                     unprocessed_repos = get_unprocessed_repos_db(
